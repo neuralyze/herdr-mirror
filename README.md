@@ -26,10 +26,17 @@ A remote can be another machine over **ssh**, or a **container** on this one
 > and pushes agent status) and one `pane` process per mirror pane (data plane
 > — streams the remote terminal).
 
+Pane streams remain connected while switching between read-only observation
+and control. First input waits for the server to confirm control; releasing
+control returns the same stream to read-only observation. It does not start
+another SSH command for each switch. Connection loss still reconnects normally.
+
 ## Requirements
 
-- **Both ends**: herdr with the `terminal session` streams — preview build
-  `2026-06-30` or newer (`herdr channel set preview`), until the next stable.
+- **Remote machine/container**: herdr CLI and server with
+  `terminal session managed` support. This branch requires the paired Herdr
+  change; releases without that command are not supported. The remote CLI
+  talks to its own matching-version server.
 - **Local machine**: macOS or Linux on x86_64/aarch64 — install fetches the
   prebuilt binary from Releases (dev installs via `herdr plugin link` build
   from source with `cargo build --release`).
@@ -138,6 +145,13 @@ its whole lifetime, each over its own connection, so panes are never
 blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
+
+**Remote titles** — a mirror pane takes its remote pane's live terminal title
+as its own, so herdr's `terminal_title` for the mirror (and anything that names
+panes by it — `herdr pane list`, other herdr clients) reads what the remote
+says rather than the local `.mirror-pane` placeholder. Changes follow within a
+second or so; a remote too old to publish `pane.updated` catches up on each
+sync instead.
 
 ### Keybinds
 
@@ -434,6 +448,15 @@ identified as disposable merely because their directory matches.
   never move a byte) fall back automatically to an exec relay — see
   `api_transport` above. The remote needs `socat` or `python3` for that path;
   almost everything has one or the other.
+- **Mirror panes report a placeholder cwd** — herdr takes a pane's directory
+  from its process, or from OSC 7 / OSC 1337 `CurrentDir`, but accepts only a
+  local host and a directory that exists locally, so a remote path can't be
+  handed to it. `cwd` for a mirror stays the `.mirror-pane` placeholder; publish
+  the remote directory as a [sidebar token](#sidebar-tokens) instead.
+- **No local scrollback on mirror panes** — the streamer draws on the alternate
+  screen, which herdr keeps no history for, so `herdr pane read` on a mirror
+  returns its visible rows only. Scroll with the wheel (it scrolls the remote),
+  or read the remote pane itself.
 
 ## License
 

@@ -169,9 +169,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
 }
 
 // ---------------------------------------------------------------------------
-// remote session: one ssh child running observe or control
+// remote session: one managed ssh/docker child across every mode transition
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Mode {
     Observe,
     Control,
@@ -188,30 +189,57 @@ impl Mode {
 
 #[derive(Debug, Deserialize)]
 struct Frame {
-    #[serde(rename = "type")]
-    kind: String,
     seq: Option<u64>,
     full: Option<bool>,
     width: Option<usize>,
     height: Option<usize>,
     bytes: Option<String>,
-    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalState {
+    request_id: u64,
+    target: String,
+    mode: Mode,
+    cols: usize,
+    rows: usize,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum StreamMessage {
+    #[serde(rename = "terminal.frame")]
+    Frame(Frame),
+    #[serde(rename = "terminal.state")]
+    State(TerminalState),
+    #[serde(rename = "terminal.closed")]
+    Closed { reason: Option<String> },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModeRequest {
+    request_id: u64,
+    mode: Mode,
 }
 
 enum Msg {
-    Frame { gen: u64, frame: Frame },
-    SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
+    Remote { gen: u64, message: StreamMessage },
+    SessionExit { gen: u64, reason: String },
+    ProtocolError { gen: u64, reason: String },
     Stdin(Vec<u8>),
-    /// result of a background foreground poll; None=poll failed (keep the last
-    /// value)
-    Foreground(Option<Fg>),
-    Paste(crate::paste::Outcome),
-    Drop(crate::paste::DropResult),
+    StdinClosed,
+    /// Failed polls retain the last classification; old generations cannot
+    /// change a replacement stream's input routing.
+    Foreground { gen: u64, value: Option<Fg> },
+    Paste { epoch: u64, outcome: crate::paste::Outcome },
+    Drop { epoch: u64, result: crate::paste::DropResult },
 }
 
 struct Session {
     gen: u64,
-    mode: Mode,
     process_group: i32,
     stdin: ChildStdin,
 }
@@ -247,7 +275,7 @@ fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
     argv
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+fn managed_command(args: &Args, cols: usize, rows: usize) -> String {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -255,14 +283,54 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         args.remote_bin.as_deref(),
         args.session.as_deref(),
     );
-    let cmd = format!(
-        "exec {} terminal session {} {} --cols {} --rows {}",
+    format!(
+        "exec {} terminal session managed {} --cols {} --rows {}",
         bin,
-        mode.as_str(),
         sh_quote(&args.pane_target),
         cols,
         rows
-    );
+    )
+}
+
+/// Consume stdout in wire order, including state barriers between frames.
+/// Keeping this shared with the real child reader makes fragmented-state and
+/// frame-order tests exercise the consumer rather than a second parser.
+async fn consume_stream(
+    stdout: impl tokio::io::AsyncRead + Unpin,
+    gen: u64,
+    tx: &mpsc::Sender<Msg>,
+) -> String {
+    let mut reason = String::new();
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                reason = format!("managed terminal stream read failed: {e}");
+                break;
+            }
+        };
+        let message = match serde_json::from_str::<StreamMessage>(&line) {
+            Ok(message) => message,
+            Err(e) => {
+                reason = format!("invalid managed terminal stream: {e}");
+                let _ = tx.send(Msg::ProtocolError { gen, reason: reason.clone() }).await;
+                break;
+            }
+        };
+        if let StreamMessage::Closed { reason: Some(r) } = &message {
+            reason = r.clone();
+        }
+        if tx.send(Msg::Remote { gen, message }).await.is_err() {
+            break;
+        }
+    }
+    reason
+}
+
+fn spawn_session(args: &Args, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+    let cmd = managed_command(args, cols, rows);
     // ssh and docker differ only in how the command is carried; the streaming
     // contract (piped stdio, herdr's frames on stdout) is identical
     let mut builder = match &args.container {
@@ -300,14 +368,13 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
-    let started = Instant::now();
 
     tokio::spawn(async move {
         // ssh errors arrive on stderr; the server's failure reason arrives as
         // a terminal.closed frame on STDOUT — capture both
         let err_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let err_tail2 = err_tail.clone();
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(l)) = lines.next_line().await {
                 let mut buf = err_tail2.lock().unwrap();
@@ -319,27 +386,19 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
                 }
             }
         });
-        let mut close_reason = String::new();
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(frame) = serde_json::from_str::<Frame>(&line) else { continue };
-            if frame.kind == "terminal.closed" {
-                if let Some(r) = &frame.reason {
-                    close_reason = r.clone();
-                }
-            }
-            if tx.send(Msg::Frame { gen, frame }).await.is_err() {
-                break;
-            }
-        }
+        let close_reason = consume_stream(stdout, gen, &tx).await;
         let _ = child.wait().await;
+        // A fast unsupported CLI can exit before its stderr reader is polled.
+        // Drain its error before classifying the exit, without waiting forever
+        // for a descendant that inherited the pipe.
+        let _ = tokio::time::timeout(Duration::from_millis(100), &mut stderr_task).await;
         stderr_task.abort();
         let tail = err_tail.lock().unwrap().trim().to_string();
         let reason = if close_reason.is_empty() { tail } else { close_reason };
-        let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
+        let _ = tx.send(Msg::SessionExit { gen, reason }).await;
     });
 
-    Ok(Session { gen, mode, process_group, stdin })
+    Ok(Session { gen, process_group, stdin })
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +461,7 @@ fn observe_size_for(args: &Args, term: (usize, usize)) -> (usize, usize) {
     (args.cols.max(term.0), args.rows.max(term.1))
 }
 
-/// Mode to open with. Split out from `run` so the composition is testable.
+/// Desired mode after the initial Observe acknowledgement, never the CLI mode.
 fn initial_mode(always_control: bool, size: (usize, usize)) -> Mode {
     if always_control && size_is_trusted(size) {
         Mode::Control
@@ -453,6 +512,55 @@ fn write_stdout(s: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(s.as_bytes());
     let _ = out.flush();
+}
+
+/// Longest remote title relayed, in chars. Titles are one-line labels (an
+/// agent's task summary); the bound only stops a hostile or broken remote from
+/// pushing an arbitrarily large string through every herdr client's pane list.
+const TITLE_MAX_CHARS: usize = 256;
+
+/// Make a remote title safe to re-emit inside OSC 2. It travels from another
+/// machine into the local terminal stream, where a control char ends the string
+/// early — BEL, ESC (the start of ST), a C1 ST — and runs whatever follows as
+/// terminal input. `is_control` covers all of C0, DEL and C1.
+fn sanitize_title(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(TITLE_MAX_CHARS).collect()
+}
+
+/// The OSC 2 that makes this pane's title the relayed one, or `None` when
+/// there is nothing to write: no relay for us, a relay addressed to a different
+/// remote pane (a previous holder of this reused local id), or no change.
+///
+/// A remote pane with no title is written as an empty OSC 2, which herdr reads
+/// as "no title" — rather than leaving the one the shell set before `exec`.
+fn title_update(
+    relayed: Option<crate::state::PaneTitle>,
+    pane_target: &str,
+    shown: &mut Option<String>,
+) -> Option<String> {
+    let relayed = relayed.filter(|t| t.remote == pane_target)?;
+    let clean = sanitize_title(relayed.title.as_deref().unwrap_or(""));
+    if shown.as_deref() == Some(clean.as_str()) {
+        return None;
+    }
+    let seq = format!("\x1b]2;{clean}\x07");
+    *shown = Some(clean);
+    Some(seq)
+}
+
+/// Show the remote pane's title as this pane's own, so herdr's `terminal_title`
+/// for the mirror is the remote's. Only a streamer drawing into a herdr pane
+/// (tty, `HERDR_PANE_ID` known) has a title to set.
+fn relay_title(
+    state_dir: &std::path::Path,
+    local_pane_id: Option<&str>,
+    pane_target: &str,
+    shown: &mut Option<String>,
+) {
+    let Some(id) = local_pane_id else { return };
+    if let Some(seq) = title_update(crate::state::read_pane_title(state_dir, id), pane_target, shown) {
+        write_stdout(&seq);
+    }
 }
 
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
@@ -705,6 +813,24 @@ pub(crate) fn split_paste(buf: &mut Vec<u8>, chunk: Vec<u8>) -> PasteSplit {
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
+/// A mixed keyboard/mouse read still contains real input. A mouse report must
+/// not make us discard the keystrokes beside it while observing.
+fn has_keyboard_input(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        match parse_mouse(bytes, at) {
+            Some((_, _, _, _, len)) => at += len,
+            None => return true,
+        }
+    }
+    false
+}
+
+enum PendingInput {
+    Raw(Vec<u8>),
+    /// Paste/upload bytes are data: never re-interpret their shortcuts or mouse.
+    Literal(Vec<u8>),
+}
 
 
 // ---------------------------------------------------------------------------
@@ -719,9 +845,8 @@ const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 /// also keeps "gone" recoverable, which it sometimes is — a remote herdr
 /// restarting renumbers pane ids while session restore runs.
 const GONE_BACKOFF_MS: u64 = 60_000;
-
-const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+
 
 /// Is this failure "the pane we stream is gone", as opposed to any other
 /// failure that happens to mention something missing?
@@ -760,6 +885,19 @@ fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
     (BACKOFF[idx.min(BACKOFF.len() - 1)], idx + 1)
 }
 
+fn managed_unsupported(reason: &str) -> bool {
+    let text = reason.to_ascii_lowercase();
+    (text.contains("managed")
+        && (text.contains("unrecognized") || text.contains("unknown")
+            || text.contains("unexpected argument") || text.contains("unsupported")
+            || text.contains("requires") || text.contains("require ")
+            || text.contains("upgrade")))
+        || (text.contains("terminal.session.")
+            && (text.contains("unsupported") || text.contains("unknown")
+                || text.contains("not supported")))
+        || text.contains("without an initial terminal.state")
+}
+
 struct App {
     args: Args,
     tty: bool,
@@ -767,19 +905,28 @@ struct App {
     renderer: Renderer,
     tx: mpsc::Sender<Msg>,
 
+    /// Last authoritative state, never the requested/speculated mode.
     mode: Mode,
-    /// in-flight mode switch (guards fast re-entry)
-    switching_to: Option<Mode>,
-    switch_at: Option<Instant>,
+    desired_mode: Mode,
+    state_ready: bool,
+    pending_mode: Option<ModeRequest>,
+    /// Increasing across reconnects as well as transitions; generation is an
+    /// additional guard, not a substitute for request correlation.
+    next_request: u64,
+    state_error: Option<String>,
+    unsupported: bool,
+    resize_pending: bool,
     session: Option<Session>,
     next_gen: u64,
 
     backoff_idx: usize,
-    reconnect_at: Option<(Instant, Mode)>,
-    /// consecutive quick control failures → fall back to observe
+    reconnect_at: Option<Instant>,
     control_failures: u32,
+    control_since: Option<Instant>,
     control_sticky: bool,
-    pending_input: Vec<Vec<u8>>,
+    pending_input: Vec<PendingInput>,
+    /// Invalidates clipboard/upload callbacks on release, denial or disconnect.
+    input_epoch: u64,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
@@ -828,6 +975,108 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
+    fn new(args: Args, tty: bool, tx: mpsc::Sender<Msg>) -> Self {
+        Self {
+            args,
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            tx,
+            mode: Mode::Observe,
+            desired_mode: Mode::Observe,
+            state_ready: false,
+            pending_mode: None,
+            next_request: 0,
+            state_error: None,
+            unsupported: false,
+            resize_pending: false,
+            session: None,
+            next_gen: 0,
+            backoff_idx: 0,
+            reconnect_at: None,
+            control_failures: 0,
+            control_since: None,
+            control_sticky: false,
+            pending_input: Vec::new(),
+            input_epoch: 0,
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            settle_at: None,
+            mouse_grabbed: tty,
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        }
+    }
+
+    fn can_write(&self) -> bool {
+        self.session.is_some() && self.state_ready && self.mode == Mode::Control
+            && self.pending_mode.is_none() && self.desired_mode == Mode::Control
+    }
+
+    fn mode_label(&self) -> &'static str {
+        if self.state_ready && self.mode == Mode::Control { "CONTROL" } else { "viewing only" }
+    }
+
+    fn mode_status(&self) -> String {
+        if self.unsupported {
+            return "managed sessions unavailable — upgrade the remote Herdr CLI and server to matching managed-session support; type to retry".into();
+        }
+        if self.session.is_none() {
+            return self.state_error.clone().unwrap_or_else(|| "disconnected — reconnecting…".into());
+        }
+        if !self.state_ready {
+            return "connecting — awaiting managed Observe acknowledgement".into();
+        }
+        let label = self.mode_label();
+        if let Some(request) = self.pending_mode {
+            return format!("{label} — {}", if request.mode == Mode::Control {
+                "taking control…"
+            } else {
+                "releasing…"
+            });
+        }
+        if let Some(error) = &self.state_error {
+            return format!("{label} — {error}; {}", if self.mode == Mode::Control {
+                "ctrl+\\ to retry release"
+            } else {
+                "type to retry"
+            });
+        }
+        if self.paste_inflight {
+            return format!("{label} — uploading…");
+        }
+        match self.mode {
+            Mode::Observe => "viewing only — type to take control".into(),
+            Mode::Control if self.args.always_control => "CONTROL".into(),
+            Mode::Control => "CONTROL — ctrl+\\ to release".into(),
+        }
+    }
+
+    fn restore_mode_status(&mut self) {
+        self.renderer.status(&self.mode_status());
+        self.hint_clear_at = None;
+    }
+
+    fn cancel_paste(&mut self) {
+        self.input_epoch += 1;
+        self.paste_inflight = false;
+        self.paste_original = None;
+        self.paste_queue.clear();
+        self.paste_buf.clear();
+        self.mouse_buf.clear();
+        self.mouse_flush_at = None;
+    }
+
     fn paint(&mut self) {
         if !self.tty {
             return;
@@ -881,7 +1130,7 @@ impl App {
     /// A hint that stays up longer than the usual flash, for one the user did
     /// not cause by typing and so is not already watching for.
     fn hint_for(&mut self, text: &str, ttl: Duration) {
-        self.renderer.status(text);
+        self.renderer.status(&format!("{} — {text}", self.mode_label()));
         self.paint();
         self.hint_clear_at = Some(Instant::now() + ttl);
     }
@@ -890,7 +1139,7 @@ impl App {
     /// can outlast the usual 1.5s and the pane would otherwise look idle while
     /// it is busy. Whoever set it replaces it when the work resolves.
     fn hint_sticky(&mut self, text: &str) {
-        self.renderer.status(text);
+        self.renderer.status(&format!("{} — {text}", self.mode_label()));
         self.paint();
         self.hint_clear_at = None;
     }
@@ -899,6 +1148,7 @@ impl App {
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
     fn spawn_foreground_poll(&mut self, force: bool) {
+        let Some(gen) = self.session.as_ref().map(|s| s.gen) else { return };
         let now = Instant::now();
         if !force && self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
             return;
@@ -921,7 +1171,7 @@ impl App {
                 container.as_ref(),
             )
             .await;
-            let _ = tx.send(Msg::Foreground(v)).await;
+            let _ = tx.send(Msg::Foreground { gen, value: v }).await;
         });
     }
 
@@ -969,7 +1219,8 @@ impl App {
     }
 
     fn observe_size(&self) -> (usize, usize) {
-        observe_size_for(&self.args, if self.tty { term_size() } else { (0, 0) })
+        let (cols, rows) = observe_size_for(&self.args, if self.tty { term_size() } else { (0, 0) });
+        (cols.max(self.grid.width), rows.max(self.grid.height))
     }
 
     /// Size to enter (and stay in) control at. Control is authoritative on the
@@ -982,127 +1233,231 @@ impl App {
         cap_size(term_size(), self.args.max_cols, self.args.max_rows)
     }
 
-    /// Stop the child (clean release first for control) — never leave an
-    /// orphan holding the remote attach lock.
-    fn stop_session(&mut self) {
+    /// FINAL detach only. Ordinary Observe transitions never close this pipe or
+    /// replace the transport; EOF also releases any acquisition still in flight.
+    async fn stop_session(&mut self) {
         if let Some(mut s) = self.session.take() {
-            tokio::spawn(async move {
-                if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                kill_session_process_group(s.process_group);
-            });
+            let _ = tokio::time::timeout(Duration::from_millis(150), async {
+                let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+                let _ = s.stdin.shutdown().await;
+            }).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            kill_session_process_group(s.process_group);
         }
     }
 
-    async fn connect(&mut self, m: Mode) {
-        self.mode = m;
-        // re-earn prediction confidence against the new session's frames
+    async fn connect(&mut self, desired: Mode) {
+        self.mode = Mode::Observe;
+        self.control_since = None;
+        self.desired_mode = desired;
+        self.state_ready = false;
+        self.pending_mode = None;
+        self.state_error = None;
+        self.unsupported = false;
+        self.resize_pending = false;
         self.predict = Predictor::new();
-        // the new session repaints from scratch, so a span from the old one
-        // points at text that no longer exists
         self.select.clear();
-        let (cols, rows) = match m {
-            Mode::Observe => self.observe_size(),
-            Mode::Control => self.control_size(),
-        };
+        self.cancel_paste();
+        let (cols, rows) = self.observe_size();
         if let Some(s) = self.session.take() {
             kill_session_process_group(s.process_group);
         }
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
-            Ok(mut s) => {
-                if m == Mode::Control {
-                    self.last_input = Instant::now();
-                    // keystrokes typed while the control session was spinning up
-                    for buf in std::mem::take(&mut self.pending_input) {
-                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
-                        let _ = s.stdin.write_all(line.as_bytes()).await;
-                    }
-                } else {
-                    self.pending_input.clear();
-                }
+        match spawn_session(&self.args, cols, rows, self.next_gen, self.tx.clone()) {
+            Ok(s) => {
                 self.session = Some(s);
-                // warm the foreground classification before the user mouses
+                self.restore_mode_status();
                 self.spawn_foreground_poll(false);
-                // always-control has no release, so no "ctrl+\ to release" hint
-                self.renderer.status(
-                    if m == Mode::Control && !self.args.always_control {
-                        "CONTROL — ctrl+\\ to release"
-                    } else {
-                        ""
-                    },
-                );
+                self.paint();
             }
-            Err(e) => self.schedule_reconnect(m, &e.to_string()),
+            Err(e) => self.schedule_reconnect(&e.to_string()),
         }
     }
 
-    fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
-        // Only slow down once we are back in observe. In control the existing
-        // quick-failure fallback needs its fast retries to reach two failures
-        // and drop the pane to observe within seconds; a 60s rung there would
-        // leave an always_control pane stuck in control for a minute.
-        let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
+    fn schedule_reconnect(&mut self, reason: &str) {
+        let gone = target_gone(reason, &self.args.pane_target);
         let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
         self.backoff_idx = idx;
-
-        if gone {
-            // Repainted every cycle on purpose: handle_frame paints herdr's
-            // raw close reason before us on each attempt, so saying this once
-            // would leave the misleading "terminal closed" line on screen from
-            // the second cycle onward. The renderer diffs rows, so an
-            // unchanged line costs one row write a minute.
-            self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
-            // and nothing may expire it out from under us: the control→observe
-            // fallback sets a 1.5s hint just before this path runs
-            self.hint_clear_at = None;
+        self.reconnect_at = Some(Instant::now() + Duration::from_millis(delay));
+        self.state_error = Some(if gone {
+            format!("remote pane {} is gone", self.args.pane_target)
         } else {
-            let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-            self.renderer
-                .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
-        }
+            let suffix = if reason.is_empty() { String::new() } else {
+                format!(" — {}", sanitize_title(reason))
+            };
+            format!("disconnected — reconnecting in {}s (managed Observe){suffix}", delay / 1000)
+        });
+        self.restore_mode_status();
         self.paint();
-        self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
     }
 
 
-    fn switch_mode(&mut self, m: Mode) {
-        // already settled or scheduled — don't restart. Without this guard,
-        // fast typing during the 200ms connect gap would spawn one control
-        // ssh per keystroke, all racing to attach the same terminal.
-        if self.switching_to == Some(m) || (self.switching_to.is_none() && self.mode == m) {
+    async fn switch_mode(&mut self, mode: Mode) {
+        self.request_mode(mode, false).await;
+    }
+
+    async fn request_mode(&mut self, mode: Mode, refresh: bool) {
+        self.desired_mode = mode;
+        if self.session.is_none() {
+            self.reconnect_at = Some(Instant::now());
             return;
         }
-        self.reconnect_at = None;
-        self.switching_to = Some(m);
-        self.stop_session();
-        // covers every route into a mode change that returns before the mouse
-        // loop: ctrl+\, the idle release, and taking control from Observe
+        // Startup is itself acknowledged. An early keystroke (or explicit
+        // always-control startup intent) waits for state 0, not merely spawn().
+        if !self.state_ready {
+            self.restore_mode_status();
+            return;
+        }
+        if self.pending_mode.is_some_and(|p| p.mode == mode)
+            || (!refresh && self.pending_mode.is_none() && self.mode == mode) {
+            return;
+        }
+        self.next_request += 1;
+        let request_id = self.next_request;
+        self.pending_mode = Some(ModeRequest { request_id, mode });
+        self.state_error = None;
+        self.predict = Predictor::new();
         self.select.clear();
         self.renderer.invalidate();
-        // immediate feedback for the mode-switch gap (stop + 200ms + reconnect)
-        self.renderer.status(if m == Mode::Control { "taking control…" } else { "releasing…" });
+        self.restore_mode_status();
         self.paint();
-        self.switch_at = Some(Instant::now() + SWITCH_GAP);
+        let (cols, rows) = match mode {
+            Mode::Control => self.control_size(),
+            Mode::Observe => self.observe_size(),
+        };
+        self.write_message(json!({
+            "type": if mode == Mode::Control { "terminal.acquire" } else { "terminal.observe" },
+            "request_id": request_id, "cols": cols, "rows": rows,
+        })).await;
     }
 
-    fn handle_frame(&mut self, gen: u64, frame: Frame) {
+    async fn release_control(&mut self, idle: bool) {
+        self.control_sticky = idle;
+        self.pending_input.clear();
+        self.cancel_paste();
+        self.switch_mode(Mode::Observe).await;
+    }
+
+    async fn handle_resize(&mut self) {
+        self.renderer.invalidate();
+        // Preserve the explicit always-control option, but never auto-acquire
+        // for the default Observe mode or retry a denied lease on window drags.
+        if self.args.always_control && self.mode == Mode::Observe && !self.control_sticky {
+            self.switch_mode(Mode::Control).await;
+        }
+        if self.can_write() {
+            let (cols, rows) = self.control_size();
+            self.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+        } else if self.pending_mode.is_some() || !self.state_ready {
+            self.resize_pending = true;
+        } else if self.session.is_some() {
+            // Observe geometry is a viewport request, never terminal.resize.
+            self.request_mode(Mode::Observe, true).await;
+        }
+        self.paint();
+    }
+
+    async fn handle_remote(&mut self, gen: u64, message: StreamMessage) {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
-            return; // stale frame from a replaced session
-        }
-        if frame.kind == "terminal.closed" {
-            let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
-            self.renderer.status(&format!("remote terminal closed{suffix}"));
-            self.paint();
             return;
         }
-        if frame.kind != "terminal.frame" {
+        match message {
+            StreamMessage::State(state) => self.handle_state(gen, state).await,
+            StreamMessage::Frame(frame) if self.state_ready => self.handle_frame(frame),
+            StreamMessage::Frame(_) => self.handle_exit(
+                gen, "managed stream sent frames without an initial terminal.state; upgrade remote Herdr CLI and server",
+            ),
+            StreamMessage::Closed { reason } => self.handle_exit(
+                gen, reason.as_deref().unwrap_or("remote terminal closed"),
+            ),
+            StreamMessage::Unknown => {}
+        }
+    }
+
+    async fn handle_state(&mut self, gen: u64, state: TerminalState) {
+        if self.session.as_ref().map(|s| s.gen) != Some(gen)
+            || state.target != self.args.pane_target {
             return;
         }
+        let requested = if !self.state_ready {
+            if state.request_id != 0 { return; }
+            Mode::Observe
+        } else {
+            let Some(request) = self.pending_mode else { return };
+            if request.request_id != state.request_id { return; }
+            request.mode
+        };
+        let initial = !self.state_ready;
+        if let Some(error) = state.error.as_deref() {
+            if initial || managed_unsupported(error) {
+                self.handle_exit(gen, error);
+                return;
+            }
+        }
+        if state.error.is_none()
+            && (state.cols == 0 || state.rows == 0 || state.mode != requested) {
+            self.handle_exit(gen, "invalid managed terminal.state acknowledgement");
+            return;
+        }
+        if !initial {
+            self.pending_mode = None;
+        }
+        self.state_ready = true;
+        if state.mode == Mode::Observe {
+            self.control_since = None;
+        } else if self.mode != Mode::Control {
+            self.control_since = Some(Instant::now());
+        }
+        self.mode = state.mode;
+        self.predict = Predictor::new();
+        self.select.clear();
+        if let Some(error) = state.error {
+            // Denial is a real state reply, not a transport failure. Keep the
+            // stream viewable and do not later replay rejected keystrokes.
+            self.pending_input.clear();
+            self.cancel_paste();
+            self.desired_mode = state.mode;
+            self.control_sticky = true;
+            self.state_error = Some(format!("{} failed: {}", requested.as_str(), sanitize_title(&error)));
+        } else {
+            self.state_error = None;
+            if initial && self.desired_mode == Mode::Control {
+                self.switch_mode(Mode::Control).await;
+                return;
+            }
+            self.desired_mode = state.mode;
+            if self.mode == Mode::Control {
+                self.last_input = Instant::now();
+                if std::mem::take(&mut self.resize_pending) {
+                    let (cols, rows) = self.control_size();
+                    self.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+                }
+                // Take once; duplicate or superseded acknowledgements cannot
+                // re-enter this flush. Raw input keeps mouse routing, while
+                // pastes stay literal and never turn into local shortcuts.
+                let pending = std::mem::take(&mut self.pending_input);
+                for input in pending {
+                    if !self.can_write() { break; }
+                    match input {
+                        PendingInput::Raw(bytes) => self.handle_stdin_inner(bytes).await,
+                        PendingInput::Literal(bytes) => self.deliver_input(bytes).await,
+                    }
+                }
+            } else if self.resize_pending {
+                self.resize_pending = false;
+                self.request_mode(Mode::Observe, true).await;
+                return;
+            }
+        }
+        self.restore_mode_status();
+        self.paint();
+    }
+
+    fn handle_frame(&mut self, frame: Frame) {
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
+        // Preserve the original transient status/viewport convention. Only the
+        // state handler may announce CONTROL, never spawn or frame arrival.
         self.renderer.status("");
         let (fw, fh) = (
             frame.width.unwrap_or(self.grid.width),
@@ -1139,34 +1494,71 @@ impl App {
         }
     }
 
-    fn handle_exit(&mut self, gen: u64, exited_mode: Mode, reason: String, uptime: Duration) {
+    fn handle_exit(&mut self, gen: u64, reason: &str) {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
-            return; // an old child we already replaced/killed
+            return;
         }
-        self.session = None;
-        let reason_line =
-            reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
-        // control that dies quickly twice is failing (refused/dropped): fall
-        // back to observe so the pane stays viewable; a keystroke retries
-        if exited_mode == Mode::Control {
-            self.control_failures = if uptime < QUICK_CONTROL_FAILURE { self.control_failures + 1 } else { 0 };
+        if self.mode == Mode::Control {
+            self.control_failures = if self.control_since.is_some_and(|t| t.elapsed() < QUICK_CONTROL_FAILURE) {
+                self.control_failures + 1
+            } else {
+                0
+            };
             if self.control_failures >= 2 {
                 self.control_failures = 0;
                 self.control_sticky = true;
-                self.switch_mode(Mode::Observe);
-                let suffix = if reason_line.is_empty() { String::new() } else { format!(" ({reason_line})") };
-                self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
-                return;
             }
         }
-        self.schedule_reconnect(exited_mode, &reason_line);
+        self.control_since = None;
+        if let Some(s) = self.session.take() {
+            kill_session_process_group(s.process_group);
+        }
+        let discarded = !self.pending_input.is_empty() || self.paste_inflight;
+        self.pending_input.clear();
+        self.cancel_paste();
+        self.mode = Mode::Observe;
+        self.state_ready = false;
+        self.pending_mode = None;
+        self.resize_pending = false;
+        self.predict = Predictor::new();
+        self.select.clear();
+        self.remote_fg = None;
+        self.settle_at = None;
+        self.desired_mode = if self.args.always_control && !self.control_sticky {
+            initial_mode(true, term_size())
+        } else {
+            Mode::Observe
+        };
+        let reason = reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("");
+        self.unsupported = managed_unsupported(reason);
+        if self.unsupported {
+            self.reconnect_at = None;
+            self.restore_mode_status();
+            self.paint();
+        } else {
+            let reason = if discarded { format!("{reason}; unsent input discarded") } else { reason.into() };
+            self.schedule_reconnect(&reason);
+        }
     }
 
-    async fn send(&mut self, msg: serde_json::Value) {
-        if let Some(s) = self.session.as_mut() {
-            let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
+    async fn write_message(&mut self, msg: serde_json::Value) -> bool {
+        let Some(s) = self.session.as_mut() else { return false };
+        let gen = s.gen;
+        let line = msg.to_string() + "\n";
+        match s.stdin.write_all(line.as_bytes()).await {
+            Ok(()) => true,
+            Err(e) => {
+                // Partial-write delivery is unknowable: never replay it into a
+                // new connection, where it could execute twice.
+                self.handle_exit(gen, &format!("managed terminal stdin failed: {e}"));
+                false
+            }
         }
+    }
+
+    async fn send(&mut self, msg: serde_json::Value) -> bool {
+        if !self.can_write() { return false; }
+        self.write_message(msg).await
     }
 
     /// Route ordinary input after preserving a partial SGR mouse sequence.
@@ -1221,14 +1613,36 @@ impl App {
     /// Ordinary input, held back while an upload is in flight so the pasted
     /// remote paths cannot be overtaken by whatever was typed after them.
     async fn route_input(&mut self, bytes: Vec<u8>) {
-        if bytes.is_empty() {
+        if !bytes.contains(&0x1c) {
+            self.route_raw(bytes).await;
             return;
         }
+        // A local release may share a read with typing, and must also cancel an
+        // in-flight upload/acquire. Paste bodies bypass this path entirely.
+        let mut start = 0;
+        for (at, byte) in bytes.iter().enumerate() {
+            if *byte == 0x1c {
+                if start < at {
+                    self.route_raw(bytes[start..at].to_vec()).await;
+                }
+                if !self.args.always_control {
+                    self.release_control(false).await;
+                }
+                start = at + 1;
+            }
+        }
+        if start < bytes.len() {
+            self.route_raw(bytes[start..].to_vec()).await;
+        }
+    }
+
+    async fn route_raw(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() { return; }
         if self.paste_inflight {
             self.paste_queue.push(Queued::Raw(bytes));
-            return;
+        } else {
+            self.handle_stdin_inner(bytes).await;
         }
-        self.handle_stdin_inner(bytes).await;
     }
 
     /// A complete paste body, markers already stripped. A file drop is
@@ -1260,16 +1674,19 @@ impl App {
         let ssh = self.args.ssh_target.clone();
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
+        let epoch = self.input_epoch;
         tokio::spawn(async move {
             let result =
                 crate::paste::files_to_remote(&paths, &ssh, ctl.as_deref(), container.as_ref())
                     .await;
-            let _ = tx.send(Msg::Drop(result)).await;
+            let _ = tx.send(Msg::Drop { epoch, result }).await;
         });
     }
 
-    async fn handle_drop(&mut self, result: crate::paste::DropResult) {
+    async fn handle_drop(&mut self, epoch: u64, result: crate::paste::DropResult) {
+        if epoch != self.input_epoch || !self.paste_inflight { return; }
         self.paste_inflight = false;
+        self.restore_mode_status();
         let original = self.paste_original.take();
         if let Some(text) = &result.text {
             self.deliver_input(crate::paste::bracketed(text)).await;
@@ -1287,81 +1704,67 @@ impl App {
         self.drain_paste_queue().await;
     }
 
-    /// Flush input held during an upload. Stops if a queued drop starts a new
-    /// upload, leaving the remainder queued behind it so order is preserved.
+    /// Flush upload-blocked input in order. Either a file drop OR clipboard
+    /// request can start another upload; a generation change cancels the rest.
     async fn drain_paste_queue(&mut self) {
+        let epoch = self.input_epoch;
         let mut items = std::mem::take(&mut self.paste_queue).into_iter();
         while let Some(item) = items.next() {
+            if epoch != self.input_epoch { return; }
             match item {
-                Queued::Raw(b) => self.handle_stdin_inner(b).await,
-                Queued::Body(b) => {
-                    self.route_paste_body(b).await;
-                    if self.paste_inflight {
-                        self.paste_queue.extend(items);
-                        return;
-                    }
-                }
+                Queued::Raw(b) => self.route_raw(b).await,
+                Queued::Body(b) => self.route_paste_body(b).await,
+            }
+            if self.paste_inflight {
+                self.paste_queue.extend(items);
+                return;
             }
         }
     }
 
     async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
+        if buf.is_empty() { return; }
+        if buf == [0x1c] {
+            if !self.args.always_control {
+                self.release_control(false).await;
+            }
+            return;
+        }
         if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
             self.paste_inflight = true;
             let tx = self.tx.clone();
             let ssh = self.args.ssh_target.clone();
             let ctl = self.args.ctl_path.clone();
             let container = self.args.container.clone();
+            let epoch = self.input_epoch;
             tokio::spawn(async move {
                 let outcome =
                     crate::paste::clipboard_to_remote(&ssh, ctl.as_deref(), container.as_ref())
                         .await;
-                let _ = tx.send(Msg::Paste(outcome)).await;
+                let _ = tx.send(Msg::Paste { epoch, outcome }).await;
             });
             return;
         }
-        if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
-            // no quit key: the wrapper's lifecycle belongs to the hosting pane
-            if has_mouse_seq(&buf) {
-                // wheel escalates only after a soft release; a stray wheel
-                // while glancing shouldn't grab the remote's lock
-                if contains_wheel_press(&buf) {
-                    if self.control_sticky {
-                        self.control_sticky = false;
-                        self.switch_mode(Mode::Control);
-                    } else {
-                        self.hint("read-only — type to take control");
-                    }
+        if !self.can_write() {
+            if has_mouse_seq(&buf) && !has_keyboard_input(&buf)
+                && self.desired_mode != Mode::Control {
+                // A stray wheel while glancing is read-only. After an idle
+                // release, the wheel is real input and is retained through ack.
+                if contains_wheel_press(&buf) && self.control_sticky {
+                    self.control_sticky = false;
+                    self.pending_input.push(PendingInput::Raw(buf));
+                    self.switch_mode(Mode::Control).await;
+                } else if contains_wheel_press(&buf) {
+                    self.hint("read-only — type to take control");
                 }
                 return;
             }
-            // any keystroke takes control and is delivered once the session is up
             self.control_sticky = false;
-            self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
+            self.pending_input.push(PendingInput::Raw(buf));
+            self.switch_mode(Mode::Control).await;
             return;
         }
-
-        // control mode
         self.last_input = Instant::now();
-        if buf.len() == 1 && buf[0] == 0x1c {
-            // ctrl+\ — manual release. In always-control there's nothing to
-            // release to, so swallow it (never forward it: ctrl+\ is SIGQUIT).
-            if !self.args.always_control {
-                self.control_sticky = false;
-                self.switch_mode(Mode::Observe);
-            }
-            return;
-        }
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
-            // spinning up or awaiting reconnect: queue the keystroke (flushed
-            // on connect) and, if in backoff, reconnect now
-            self.pending_input.push(buf);
-            if let Some((_, m)) = self.reconnect_at {
-                self.reconnect_at = Some((Instant::now(), m));
-            }
-            return;
-        }
         // refresh the foreground classification on any input while active.
         // the grab is always held, so mouse events also trigger this — that's
         // what catches a shell→TUI switch from a click, and the reverse from
@@ -1470,9 +1873,9 @@ impl App {
             // this very read, and cancelling it would eat the click.
             sel_changed |= self.select.dismiss();
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
-            self.send(msg).await;
-            // optimistic local echo: draw the keystroke now, verify on frame
-            if self.predict.on_input(&rest, &self.grid) {
+            let sent = self.send(msg).await;
+            // No optimistic echo before acknowledgement or after failed writes.
+            if sent && self.predict.on_input(&rest, &self.grid) {
                 self.paint();
                 sel_changed = false;
             }
@@ -1483,25 +1886,21 @@ impl App {
     }
 
     async fn deliver_input(&mut self, buf: Vec<u8>) {
-        if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
+        if buf.is_empty() { return; }
+        if !self.can_write() {
             self.control_sticky = false;
-            self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
+            self.pending_input.push(PendingInput::Literal(buf));
+            self.switch_mode(Mode::Control).await;
             return;
         }
         self.last_input = Instant::now();
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
-            self.pending_input.push(buf);
-            if let Some((_, m)) = self.reconnect_at {
-                self.reconnect_at = Some((Instant::now(), m));
-            }
-            return;
-        }
         self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
     }
 
-    async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
+    async fn handle_paste(&mut self, epoch: u64, outcome: crate::paste::Outcome) {
+        if epoch != self.input_epoch || !self.paste_inflight { return; }
         self.paste_inflight = false;
+        self.restore_mode_status();
         match outcome {
             crate::paste::Outcome::NoImage => self.deliver_input(vec![0x16]).await,
             crate::paste::Outcome::Pasted(path) => {
@@ -1512,6 +1911,7 @@ impl App {
                 self.hint(&format!("image paste failed: {e}"));
             }
         }
+        self.drain_paste_queue().await;
     }
 }
 
@@ -1532,6 +1932,11 @@ pub async fn run(args: Args) -> Result<()> {
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
     let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
 
+    // Before either pidfile below exists: a pidfile is what tells the daemon
+    // and the hooks they may SIGUSR1 us, and that signal's default disposition
+    // is terminate. The daemon pokes a pane as soon as its first title lands,
+    // which is typically while this streamer is still starting up.
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
     // daemon-spawned streamer, so it must not claim the slot
@@ -1598,7 +2003,10 @@ pub async fn run(args: Args) -> Result<()> {
             let mut buf = [0u8; 1024];
             loop {
                 match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Msg::StdinClosed).await;
+                        break;
+                    }
                     Ok(n) => {
                         if tx.send(Msg::Stdin(buf[..n].to_vec())).await.is_err() {
                             break;
@@ -1609,41 +2017,10 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
-    let mut app = App {
-        args,
-        tty,
-        grid: Grid::new(),
-        renderer: Renderer::new(),
-        tx,
-        mode: Mode::Observe,
-        switching_to: None,
-        switch_at: None,
-        session: None,
-        next_gen: 0,
-        backoff_idx: 0,
-        reconnect_at: None,
-        control_failures: 0,
-        control_sticky: false,
-        pending_input: Vec::new(),
-        last_input: Instant::now(),
-        hint_clear_at: None,
-        predict: Predictor::new(),
-        remote_fg: None,
-        select: Select::new(),
-        last_select_rows: None,
-        fg_poll_at: None,
-        settle_at: None,
-        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-        // startup leaves the pane in normal cursor mode; the first classification
-        // moves it if the remote turns out to be a TUI
-        app_cursor_keys: false,
-        paste_inflight: false,
-        paste_buf: Vec::new(),
-        mouse_buf: Vec::new(),
-        mouse_flush_at: None,
-        paste_queue: Vec::new(),
-        paste_original: None,
-    };
+    let mut app = App::new(args, tty, tx);
+    // what this pane last wrote as its OSC 2 title, so repeats cost nothing
+    let mut shown_title: Option<String> = None;
+    relay_title(&state_dir, local_pane_id.as_deref(), &app.args.pane_target, &mut shown_title);
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
     // entering Control with a size we cannot vouch for is what let a local herdr
@@ -1658,8 +2035,6 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
-    // someone left a notice for this pane and wants it seen now
-    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     app.connect(initial_mode(app.args.always_control, term_size())).await;
@@ -1667,23 +2042,20 @@ pub async fn run(args: Args) -> Result<()> {
     // for that is buffered above, but check directly too
     if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
     {
-        app.switch_mode(Mode::Control);
+        app.switch_mode(Mode::Control).await;
     } else if app.args.always_control && app.mode == Mode::Observe {
         // F3: otherwise the pane is inert with no explanation
         app.hint("read-only until this pane is sized — type to take control");
     }
 
     loop {
-        // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
-        let idle_at = (app.mode == Mode::Control
-            && app.switching_to.is_none()
-            && app.session.is_some()
+        // No mode-switch sleep: all transitions use the existing managed pipe.
+        let idle_at = (app.can_write()
             && !app.args.always_control
             && app.args.control_idle_secs > 0)
             .then(|| app.last_input + Duration::from_secs(app.args.control_idle_secs));
         let sleep = crate::util::sleep_until_earliest([
-            app.switch_at,
-            app.reconnect_at.map(|(t, _)| t),
+            app.reconnect_at,
             app.hint_clear_at,
             idle_at,
             app.predict.deadline(),
@@ -1694,12 +2066,14 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
-                    None => break,
-                    Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
-                    Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    None | Some(Msg::StdinClosed) => break,
+                    Some(Msg::Remote { gen, message }) => app.handle_remote(gen, message).await,
+                    Some(Msg::SessionExit { gen, reason })
+                        | Some(Msg::ProtocolError { gen, reason }) => app.handle_exit(gen, &reason),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
-                    // keep the last good classification if a poll failed (None)
-                    Some(Msg::Foreground(v)) => if v.is_some() {
+                    // Keep the last good classification on failed/stale polls.
+                    Some(Msg::Foreground { gen, value: v }) => if v.is_some()
+                        && app.session.as_ref().map(|s| s.gen) == Some(gen) {
                         // a foreground change means the screen belongs to a
                         // different program now, so the old highlight points at
                         // text that is gone
@@ -1710,27 +2084,12 @@ pub async fn run(args: Args) -> Result<()> {
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
-                    Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
-                    Some(Msg::Drop(result)) => app.handle_drop(result).await,
+                    Some(Msg::Paste { epoch, outcome }) => app.handle_paste(epoch, outcome).await,
+                    Some(Msg::Drop { epoch, result }) => app.handle_drop(epoch, result).await,
                 }
             }
             _ = sigwinch.recv() => {
-                app.renderer.invalidate();
-                // a resize means a client is laying this pane out, so the size is
-                // now a real viewport: take control if that is what we're for.
-                // control_sticky means control was refused twice in a row and we
-                // told the user "type to retry" — a window drag must not turn
-                // that into a reconnect storm.
-                if app.args.always_control && app.mode == Mode::Observe && !app.control_sticky {
-                    app.switch_mode(Mode::Control);
-                }
-                if app.mode == Mode::Control {
-                    // capped like the initial connect: a local window drag must
-                    // not push a capped host past its ceiling either
-                    let (cols, rows) = app.control_size();
-                    app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
-                }
-                app.paint();
+                app.handle_resize().await;
             }
             _ = sigusr1.recv() => {
                 if let Some(id) = local_pane_id.as_deref() {
@@ -1738,22 +2097,18 @@ pub async fn run(args: Args) -> Result<()> {
                         app.hint_for(&msg, Duration::from_secs(4));
                     }
                 }
+                // the daemon pokes the same way when the remote title changed
+                relay_title(&state_dir, local_pane_id.as_deref(), &app.args.pane_target, &mut shown_title);
             }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
             _ = sleep => {
                 let now = Instant::now();
-                if app.switch_at.is_some_and(|t| t <= now) {
-                    app.switch_at = None;
-                    if let Some(m) = app.switching_to.take() {
-                        app.connect(m).await; // pending input from the gap flushes here
-                    }
-                }
-                if let Some((t, m)) = app.reconnect_at {
+                if let Some(t) = app.reconnect_at {
                     if t <= now {
                         app.reconnect_at = None;
-                        app.connect(m).await;
+                        app.connect(app.desired_mode).await;
                     }
                 }
                 if app.hint_clear_at.is_some_and(|t| t <= now) {
@@ -1761,10 +2116,8 @@ pub async fn run(args: Args) -> Result<()> {
                     app.renderer.status("");
                     app.paint();
                 }
-                if idle_at.is_some_and(|t| t <= now) && app.mode == Mode::Control && app.switching_to.is_none() {
-                    app.control_sticky = true;
-                    app.switch_mode(Mode::Observe);
-                    app.hint("control released (idle) — type to retake");
+                if idle_at.is_some_and(|t| t <= now) && app.can_write() {
+                    app.release_control(true).await;
                 }
                 if app.settle_at.is_some_and(|t| t <= now) {
                     app.settle_at = None;
@@ -1781,15 +2134,9 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // clean shutdown: release control if held, kill the whole local transport
-    // tree (including any ProxyCommand), restore tty
-    if let Some(mut s) = app.session.take() {
-        if s.mode == Mode::Control {
-            let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        kill_session_process_group(s.process_group);
-    }
+    // FINAL detach on local EOF, signal or pane close, including pending acquire.
+    // Title relay and tty restoration remain independent of managed mode state.
+    app.stop_session().await;
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
@@ -1807,6 +2154,438 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Commands = tokio::io::Lines<BufReader<tokio::process::ChildStdout>>;
+
+    fn state(request_id: u64, mode: Mode, error: Option<&str>) -> TerminalState {
+        TerminalState {
+            request_id, target: "p1".into(), mode, cols: 80, rows: 24,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn frame(text: &str) -> Frame {
+        Frame {
+            seq: Some(1), full: Some(true), width: Some(80), height: Some(24),
+            bytes: Some(B64.encode(text)),
+        }
+    }
+
+    // A real pipe captures the production writer's JSON. It does not model
+    // lease ownership or generate acknowledgements on behalf of the backend.
+    async fn attach_sink(app: &mut App, gen: u64) -> (tokio::process::Child, Commands) {
+        let mut command = tokio::process::Command::new("cat");
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true);
+        isolate_session_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let commands = BufReader::new(child.stdout.take().unwrap()).lines();
+        app.session = Some(Session {
+            gen, process_group: child.id().unwrap() as i32,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.next_gen = gen;
+        app.fg_poll_at = Some(Instant::now()); // Never probe SSH in unit tests.
+        (child, commands)
+    }
+
+    async fn managed_app(ready: bool) -> (App, tokio::process::Child, Commands) {
+        let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App::new(args, false, tx);
+        let (child, commands) = attach_sink(&mut app, 1).await;
+        app.state_ready = ready;
+        app.restore_mode_status();
+        (app, child, commands)
+    }
+
+    async fn command(commands: &mut Commands) -> serde_json::Value {
+        let line = tokio::time::timeout(Duration::from_secs(1), commands.next_line())
+            .await.expect("missing command").unwrap().expect("writer closed");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn quiet(commands: &mut Commands) {
+        assert!(tokio::time::timeout(Duration::from_millis(20), commands.next_line()).await.is_err(),
+            "input or transition was written before its acknowledgement");
+    }
+
+    fn input_bytes(command: &serde_json::Value) -> Vec<u8> {
+        assert_eq!(command["type"], "terminal.input");
+        B64.decode(command["bytes"].as_str().unwrap()).unwrap()
+    }
+
+    async fn finish(
+        mut app: App, mut child: tokio::process::Child, mut commands: Commands,
+    ) -> Vec<serde_json::Value> {
+        drop(app.session.take()); // Close the actual writer and read every last byte.
+        drop(app);
+        tokio::time::timeout(Duration::from_secs(1), child.wait()).await.unwrap().unwrap();
+        let mut extra = Vec::new();
+        while let Some(line) = commands.next_line().await.unwrap() {
+            extra.push(serde_json::from_str(&line).unwrap());
+        }
+        extra
+    }
+
+    #[tokio::test]
+    async fn consumer_preserves_fragmented_state_frame_and_denial_order() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::channel(16);
+        let consumer = tokio::spawn(async move { consume_stream(reader, 17, &tx).await });
+        let wire = [
+            json!({"type":"terminal.state","request_id":0,"target":"p1","mode":"observe","cols":80,"rows":24,"error":null}),
+            json!({"type":"terminal.frame","seq":1,"full":true,"width":80,"height":24,"bytes":B64.encode("old")}),
+            json!({"type":"terminal.state","request_id":4,"target":"p1","mode":"control","cols":100,"rows":30,"error":null}),
+            json!({"type":"terminal.frame","seq":2,"full":true,"width":100,"height":30,"bytes":B64.encode("new")}),
+            json!({"type":"terminal.state","request_id":5,"target":"p1","mode":"control","cols":100,"rows":30,"error":"release denied"}),
+            json!({"type":"terminal.closed","reason":"ended"}),
+        ].into_iter().map(|v| v.to_string() + "\n").collect::<String>();
+        for bytes in wire.as_bytes().chunks(7) {
+            writer.write_all(bytes).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        let mut seen = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                Msg::Remote { gen: 17, message: StreamMessage::State(s) } => {
+                    seen.push(format!("state:{}:{}:{:?}", s.request_id, s.mode.as_str(), s.error));
+                }
+                Msg::Remote { gen: 17, message: StreamMessage::Frame(f) } => {
+                    seen.push(format!("frame:{}", f.seq.unwrap()));
+                }
+                Msg::Remote { gen: 17, message: StreamMessage::Closed { reason } } => {
+                    seen.push(reason.unwrap());
+                }
+                _ => panic!("unexpected consumer message"),
+            }
+        }
+        assert_eq!(consumer.await.unwrap(), "ended");
+        assert_eq!(seen, [
+            "state:0:observe:None", "frame:1", "state:4:control:None", "frame:2",
+            "state:5:control:Some(\"release denied\")", "ended",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn consumer_rejects_malformed_states_instead_of_fabricating_ack() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let bytes = b"{\"type\":\"terminal.state\",\"request_id\":1,\"target\":\"p1\",\"mode\":\"bogus\",\"cols\":80,\"rows\":24}\n";
+        let reason = consume_stream(&bytes[..], 3, &tx).await;
+        assert!(reason.contains("invalid managed terminal stream"));
+        assert!(matches!(rx.recv().await, Some(Msg::ProtocolError { gen: 3, .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn first_input_waits_for_initial_state_and_exact_control_ack_once() {
+        let (mut app, child, mut commands) = managed_app(false).await;
+        let pid = child.id().unwrap() as i32;
+        app.handle_stdin(b"\x1b[A".to_vec()).await;
+        app.handle_stdin(b"b".to_vec()).await;
+        assert_eq!(app.mode, Mode::Observe);
+        assert!(!app.can_write());
+        assert_eq!(app.pending_input.len(), 2);
+        assert!(app.predict.deadline().is_none(), "no fake receipt by predictive echo");
+        quiet(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(0, Mode::Observe, None))).await;
+        let acquire = command(&mut commands).await;
+        assert_eq!(acquire["type"], "terminal.acquire");
+        assert_eq!(acquire["request_id"], 1);
+        assert!(acquire.get("takeover").is_none());
+        assert!(app.mode_status().starts_with("viewing only"));
+        app.handle_remote(0, StreamMessage::State(state(1, Mode::Control, None))).await;
+        let mut wrong_target = state(1, Mode::Control, None);
+        wrong_target.target = "other".into();
+        app.handle_remote(1, StreamMessage::State(wrong_target)).await;
+        app.handle_remote(1, StreamMessage::State(state(0, Mode::Observe, None))).await;
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Control, None))).await;
+        quiet(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        assert_eq!(input_bytes(&command(&mut commands).await), b"\x1b[A");
+        assert_eq!(input_bytes(&command(&mut commands).await), b"b");
+        assert!(app.can_write());
+        assert!(app.mode_status().starts_with("CONTROL"));
+        assert_eq!(app.session.as_ref().unwrap().process_group, pid);
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        assert!(finish(app, child, commands).await.is_empty(), "duplicate ack replayed input");
+    }
+
+    #[tokio::test]
+    async fn transitions_keep_one_stream_and_stale_observe_ack_cannot_flush_paste() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        let pid = child.id().unwrap() as i32;
+        app.handle_stdin(b"first".to_vec()).await;
+        assert_eq!(command(&mut commands).await["request_id"], 1);
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        assert_eq!(input_bytes(&command(&mut commands).await), b"first");
+        app.handle_stdin(vec![0x1c]).await;
+        let observe = command(&mut commands).await;
+        assert_eq!(observe["type"], "terminal.observe");
+        assert_eq!(observe["request_id"], 2);
+        assert_eq!(app.mode, Mode::Control, "release is not acknowledged yet");
+        assert!(!app.can_write());
+        assert!(app.mode_status().contains("CONTROL — releasing"));
+        let paste = crate::paste::bracketed_bytes(b"line one\n\x16\x1c\x1b[<64;1;1M\nline two");
+        app.handle_stdin(paste.clone()).await;
+        let acquire = command(&mut commands).await;
+        assert_eq!(acquire["type"], "terminal.acquire");
+        assert_eq!(acquire["request_id"], 3);
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Observe, None))).await;
+        quiet(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(3, Mode::Control, None))).await;
+        assert_eq!(input_bytes(&command(&mut commands).await), paste);
+        assert!(!app.paste_inflight, "literal Ctrl+V was interpreted as clipboard");
+        app.handle_stdin(vec![0x1c]).await;
+        assert_eq!(command(&mut commands).await["request_id"], 4);
+        app.handle_remote(1, StreamMessage::State(state(4, Mode::Observe, None))).await;
+        assert_eq!(app.mode, Mode::Observe);
+        assert!(app.mode_status().starts_with("viewing only"));
+        assert_eq!(app.session.as_ref().unwrap().process_group, pid);
+        assert_eq!(app.next_gen, 1);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_acquire_keeps_viewable_stream_and_discards_rejected_input() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        let pid = child.id().unwrap() as i32;
+        app.handle_stdin(b"rejected".to_vec()).await;
+        command(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Observe, Some("owned by another client")))).await;
+        assert!(app.pending_input.is_empty());
+        assert!(!app.can_write());
+        assert!(app.reconnect_at.is_none());
+        assert!(app.control_sticky);
+        assert!(app.mode_status().contains("owned by another client"));
+        let rendered = app.renderer.paint(&app.grid, 100, 30);
+        assert!(rendered.contains("viewing only") && rendered.contains("owned by another client"));
+        app.handle_remote(1, StreamMessage::Frame(frame("still viewable"))).await;
+        assert!(app.grid.text_lines()[0].contains("still viewable"));
+        assert!(app.mode_status().contains("owned by another client"));
+        app.handle_stdin(b"retry".to_vec()).await;
+        let acquire = command(&mut commands).await;
+        assert_eq!(acquire["request_id"], 2);
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Control, None))).await;
+        assert_eq!(input_bytes(&command(&mut commands).await), b"retry");
+        assert_eq!(app.session.as_ref().unwrap().process_group, pid);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_release_reports_authoritative_control_not_viewing() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        app.mode = Mode::Control;
+        app.desired_mode = Mode::Control;
+        app.release_control(false).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.observe");
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, Some("release refused")))).await;
+        assert!(app.can_write());
+        assert!(app.mode_status().starts_with("CONTROL"));
+        assert!(app.mode_status().contains("release refused"));
+        assert!(app.renderer.paint(&app.grid, 100, 30).contains("release refused"));
+        app.handle_remote(1, StreamMessage::Frame(frame("owned"))).await;
+        assert!(app.mode_status().starts_with("CONTROL"));
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_resize_is_only_sent_in_acknowledged_control() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        app.handle_resize().await;
+        let view = command(&mut commands).await;
+        assert_eq!(view["type"], "terminal.observe");
+        assert_eq!(view["request_id"], 1);
+        app.handle_stdin(b"x".to_vec()).await;
+        assert_eq!(command(&mut commands).await["request_id"], 2);
+        app.handle_resize().await;
+        quiet(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Observe, None))).await;
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Control, None))).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.resize");
+        assert_eq!(input_bytes(&command(&mut commands).await), b"x");
+        app.release_control(false).await;
+        assert_eq!(command(&mut commands).await["request_id"], 3);
+        app.handle_resize().await;
+        quiet(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(3, Mode::Observe, None))).await;
+        let view = command(&mut commands).await;
+        assert_eq!(view["type"], "terminal.observe");
+        assert_eq!(view["request_id"], 4);
+        app.handle_remote(1, StreamMessage::State(state(4, Mode::Observe, None))).await;
+        assert!(finish(app, child, commands).await.is_empty(), "resize escaped Observe gate");
+    }
+
+    #[tokio::test]
+    async fn idle_release_and_first_wheel_retake_are_in_place_and_exactly_once() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        app.mode = Mode::Control;
+        app.desired_mode = Mode::Control;
+        app.release_control(true).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.observe");
+        assert_eq!(app.mode, Mode::Control);
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Observe, None))).await;
+        assert!(app.control_sticky);
+        app.handle_stdin(b"\x1b[<64;7;9M".to_vec()).await;
+        assert_eq!(command(&mut commands).await["request_id"], 2);
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Control, None))).await;
+        let wheel = command(&mut commands).await;
+        assert_eq!(wheel["type"], "terminal.scroll");
+        assert_eq!(wheel["direction"], "up");
+        assert_eq!(wheel["column"], 6);
+        assert_eq!(wheel["row"], 8);
+        assert_eq!(app.next_gen, 1);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_cancels_acquire_and_invalidates_paste_callbacks() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        app.handle_stdin(b"cancel".to_vec()).await;
+        command(&mut commands).await;
+        app.paste_inflight = true;
+        let old_epoch = app.input_epoch;
+        app.handle_stdin(vec![0x1c]).await;
+        let observe = command(&mut commands).await;
+        assert_eq!(observe["type"], "terminal.observe");
+        assert_eq!(observe["request_id"], 2);
+        assert!(app.pending_input.is_empty());
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Observe, None))).await;
+        app.paste_inflight = true; // A newer upload must not be cleared by the old callback.
+        app.handle_paste(old_epoch, crate::paste::Outcome::Pasted("/stale/image.png".into())).await;
+        app.handle_drop(old_epoch, crate::paste::DropResult {
+            text: Some("/stale/drop".into()), unchanged: false, error: None,
+        }).await;
+        assert!(app.paste_inflight);
+        assert_eq!(app.mode, Mode::Observe);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clipboard_result_and_following_typing_keep_literal_order_through_ack() {
+        let (mut app, child, mut commands) = managed_app(true).await;
+        app.paste_inflight = true;
+        let epoch = app.input_epoch;
+        app.handle_stdin(b"after".to_vec()).await;
+        assert_eq!(app.paste_queue.len(), 1);
+        app.handle_paste(epoch, crate::paste::Outcome::NoImage).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.acquire");
+        assert_eq!(app.pending_input.len(), 2);
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        assert_eq!(input_bytes(&command(&mut commands).await), [0x16]);
+        assert_eq!(input_bytes(&command(&mut commands).await), b"after");
+        assert!(!app.paste_inflight);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_drops_old_input_and_correlates_new_generation_monotonically() {
+        let (mut app, mut old_child, mut old_commands) = managed_app(true).await;
+        app.handle_stdin(b"old unsent".to_vec()).await;
+        assert_eq!(command(&mut old_commands).await["request_id"], 1);
+        app.handle_exit(1, "transport lost");
+        assert!(app.pending_input.is_empty());
+        assert!(app.reconnect_at.is_some());
+        assert!(app.mode_status().contains("unsent input discarded"));
+        tokio::time::timeout(Duration::from_secs(1), old_child.wait()).await.unwrap().unwrap();
+        let (child, mut commands) = attach_sink(&mut app, 2).await;
+        app.reconnect_at = None;
+        app.handle_stdin(b"new".to_vec()).await;
+        app.handle_remote(2, StreamMessage::State(state(0, Mode::Observe, None))).await;
+        assert_eq!(command(&mut commands).await["request_id"], 2);
+        app.handle_remote(1, StreamMessage::State(state(2, Mode::Control, None))).await;
+        app.handle_remote(1, StreamMessage::Frame(frame("stale screen"))).await;
+        app.handle_exit(1, "stale exit");
+        assert_eq!(app.session.as_ref().unwrap().gen, 2);
+        assert_eq!(app.grid.width, 0);
+        quiet(&mut commands).await;
+        app.handle_remote(2, StreamMessage::State(state(2, Mode::Control, None))).await;
+        assert_eq!(input_bytes(&command(&mut commands).await), b"new");
+        assert!(finish(app, child, commands).await.is_empty());
+        assert!(old_commands.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_cli_and_unacknowledged_stream_require_matching_upgrade() {
+        for reason in [
+            "error: unrecognized subcommand 'managed'",
+            "unsupported endpoint control kind terminal.session.set_mode",
+            "managed terminal sessions require matching Herdr CLI and server upgrade",
+        ] {
+            let (mut app, child, commands) = managed_app(false).await;
+            app.handle_remote(1, StreamMessage::Closed { reason: Some(reason.into()) }).await;
+            assert!(app.unsupported, "{reason}");
+            assert!(app.session.is_none());
+            assert!(app.reconnect_at.is_none(), "must not cold-fallback");
+            assert!(app.mode_status().contains("upgrade the remote Herdr CLI and server"));
+            assert!(finish(app, child, commands).await.is_empty());
+        }
+        let (mut app, child, commands) = managed_app(false).await;
+        app.handle_remote(1, StreamMessage::Frame(frame("not an acknowledgement"))).await;
+        assert!(app.unsupported);
+        assert_eq!(app.grid.width, 0);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_always_control_intent_survives_initial_observe_ack_and_resize() {
+        let (mut app, child, mut commands) = managed_app(false).await;
+        app.args.always_control = true;
+        app.desired_mode = initial_mode(true, (141, 44));
+        assert_eq!(app.desired_mode, Mode::Control);
+        app.handle_resize().await;
+        quiet(&mut commands).await;
+        app.handle_remote(1, StreamMessage::State(state(0, Mode::Observe, None))).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.acquire");
+        assert!(!app.can_write());
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.resize");
+        assert!(app.can_write());
+        assert_eq!(app.mode_status(), "CONTROL");
+        app.handle_stdin(vec![0x1c]).await; // Existing opt-in flag swallows release.
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_quick_control_losses_fall_back_without_auto_reacquire() {
+        let (mut app, mut old_child, mut old_commands) = managed_app(true).await;
+        app.args.always_control = true;
+        app.handle_stdin(b"one".to_vec()).await;
+        command(&mut old_commands).await;
+        app.handle_remote(1, StreamMessage::State(state(1, Mode::Control, None))).await;
+        command(&mut old_commands).await;
+        app.handle_exit(1, "quick control loss");
+        assert_eq!(app.control_failures, 1);
+        tokio::time::timeout(Duration::from_secs(1), old_child.wait()).await.unwrap().unwrap();
+        let (child, mut commands) = attach_sink(&mut app, 2).await;
+        app.reconnect_at = None;
+        app.handle_stdin(b"two".to_vec()).await;
+        app.handle_remote(2, StreamMessage::State(state(0, Mode::Observe, None))).await;
+        assert_eq!(command(&mut commands).await["request_id"], 2);
+        app.handle_remote(2, StreamMessage::State(state(2, Mode::Control, None))).await;
+        command(&mut commands).await;
+        app.handle_exit(2, "second quick loss");
+        assert!(app.control_sticky);
+        assert_eq!(app.desired_mode, Mode::Observe);
+        assert_eq!(app.control_failures, 0);
+        assert!(finish(app, child, commands).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_cleanup_detaches_pending_acquire_and_closes_stdin() {
+        let (mut app, mut child, mut commands) = managed_app(true).await;
+        app.handle_stdin(b"never acknowledged".to_vec()).await;
+        assert_eq!(command(&mut commands).await["type"], "terminal.acquire");
+        app.stop_session().await;
+        assert!(app.session.is_none());
+        let release = command(&mut commands).await;
+        assert_eq!(release, json!({"type":"terminal.release"}));
+        tokio::time::timeout(Duration::from_secs(1), child.wait()).await.unwrap().unwrap();
+        assert!(commands.next_line().await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn pane_transport_cleanup_terminates_proxy_command() {
@@ -1870,21 +2649,6 @@ mod tests {
         }
         let _ = std::fs::remove_file(pid_path);
         assert!(!proxy_survived, "ProxyCommand survived pane transport cleanup");
-    }
-
-    #[test]
-    fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
-
-        assert_eq!(
-            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
-            [
-                "-S",
-                "none",
-                "work",
-                "exec herdr terminal session observe w5:pM",
-            ]
-        );
     }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
@@ -2337,49 +3101,17 @@ mod tests {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
         let (tx, _rx) = mpsc::channel(256);
-        let mut app = App {
-            args,
-            tty,
-            grid: Grid::new(),
-            renderer: Renderer::new(),
-            tx,
-            mode: Mode::Observe,
-            switching_to: None,
-            switch_at: None,
-            session: None,
-            next_gen: 0,
-            backoff_idx: 0,
-            reconnect_at: None,
-            control_failures: 0,
-            control_sticky: false,
-            pending_input: Vec::new(),
-            last_input: Instant::now(),
-            hint_clear_at: None,
-            predict: Predictor::new(),
-            remote_fg: None,
-            select: Select::new(),
-            last_select_rows: None,
-            fg_poll_at: None,
-            settle_at: None,
-            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-            // startup leaves the pane in normal cursor mode; the first classification
-            // moves it if the remote turns out to be a TUI
-            app_cursor_keys: false,
-            paste_inflight: false,
-            paste_buf: Vec::new(),
-            mouse_buf: Vec::new(),
-            mouse_flush_at: None,
-            paste_queue: Vec::new(),
-            paste_original: None,
-        };
+        let mut app = App::new(args, tty, tx);
         let mut child = tokio::process::Command::new("cat")
             .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
             .spawn().unwrap();
         app.session = Some(Session {
-            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
+            gen: 1, process_group: child.id().unwrap() as i32,
             stdin: child.stdin.take().unwrap(),
         });
         app.mode = Mode::Control;
+        app.desired_mode = Mode::Control;
+        app.state_ready = true;
         app.remote_fg = Some(Fg::Mouse);
         // Keep foreground polling local to this fixture: suppress SSH probes.
         app.fg_poll_at = Some(Instant::now());
@@ -2409,6 +3141,61 @@ mod tests {
     #[tokio::test]
     async fn copying_selection_preserves_next_drag_in_same_read() {
         selection_followed_by_press(true).await;
+    }
+
+    fn relayed(remote: &str, title: Option<&str>) -> Option<crate::state::PaneTitle> {
+        Some(crate::state::PaneTitle {
+            host: "vibe1".into(),
+            remote: remote.into(),
+            title: title.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn a_remote_title_cannot_break_out_of_the_osc() {
+        // BEL and ESC \ end an OSC; C1 ST (U+009C) does too for a terminal
+        // that reads C1. Anything after them would run as local terminal input.
+        let hostile = "task\x07\x1b]0;owned\x1b\\\u{9c}\x1b[2J done";
+        assert_eq!(sanitize_title(hostile), "task]0;owned\\[2J done");
+        let mut shown = None;
+        let seq = title_update(relayed("wD:p3", Some(hostile)), "wD:p3", &mut shown).unwrap();
+        let body = seq.strip_prefix("\x1b]2;").and_then(|s| s.strip_suffix('\x07')).unwrap();
+        assert!(!body.chars().any(char::is_control), "{seq:?}");
+    }
+
+    #[test]
+    fn a_remote_title_is_bounded_on_a_char_boundary() {
+        let long = "π".repeat(TITLE_MAX_CHARS + 50);
+        let clean = sanitize_title(&long);
+        assert_eq!(clean.chars().count(), TITLE_MAX_CHARS);
+        assert!(clean.chars().all(|c| c == 'π'));
+    }
+
+    #[test]
+    fn the_remote_title_is_written_once_per_change() {
+        let mut shown = None;
+        assert_eq!(
+            title_update(relayed("wD:p3", Some("π ⠴ jev-game")), "wD:p3", &mut shown).as_deref(),
+            Some("\x1b]2;π ⠴ jev-game\x07")
+        );
+        // a poke for a hint, or a relay that repeats itself, writes nothing
+        assert_eq!(title_update(relayed("wD:p3", Some("π ⠴ jev-game")), "wD:p3", &mut shown), None);
+        assert_eq!(
+            title_update(relayed("wD:p3", Some("π > jev-game")), "wD:p3", &mut shown).as_deref(),
+            Some("\x1b]2;π > jev-game\x07")
+        );
+        // the remote dropping its title clears ours instead of keeping the last
+        assert_eq!(title_update(relayed("wD:p3", None), "wD:p3", &mut shown).as_deref(), Some("\x1b]2;\x07"));
+    }
+
+    #[test]
+    fn a_title_for_another_remote_pane_is_ignored() {
+        // herdr reuses local pane ids: a record left for the previous holder of
+        // this pane must not name the mirror now standing in it
+        let mut shown = None;
+        assert_eq!(title_update(relayed("wD:p1", Some("rpg designer")), "wD:p3", &mut shown), None);
+        assert_eq!(shown, None);
+        assert_eq!(title_update(None, "wD:p3", &mut shown), None);
     }
 
 }
