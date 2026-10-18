@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "product": "herdr-mirror",
+  "upstream_repository": "nikok6/herdr-mirror",
+  "upstream_commit": "195398c1275f9f3d18ddff70282149005a2bec01",
+  "upstream_tag": "v0.4.3",
+  "patches": [
+    {
+      "id": "persistent-remote-terminal-control",
+      "commit": "03741fe73c97ca734f2cd86dcab3c0f54d7b4198",
+      "description": "Preserve remote terminal streams and SSH connections, wait for actual control acknowledgement, return to observation without reconnecting, and forward remote terminal titles.",
+      "keywords": ["managed terminal", "persistent stream", "first input", "control release", "terminal title"]
+    }
+  ]
+}

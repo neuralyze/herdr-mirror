@@ -1,0 +1,25 @@
+name: Update maintained Herdr mirror
+
+# Install as .github/workflows/maintenance-update.yml in neuralyze/herdr-mirror
+# after rendering both f4544112008a40ad8cb708e56f89a4587da7a20b values to one trusted 40-hex tool commit.
+# Daily UTC/manual runs propose a reviewed update; they never merge or deploy.
+on:
+  schedule:
+    - cron: '47 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  update:
+    if: github.repository == 'neuralyze/herdr-mirror' && github.ref == 'refs/heads/maintained'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    uses: neuralyze/herdr-maintenance/.github/workflows/component-update.yml@f4544112008a40ad8cb708e56f89a4587da7a20b
+    with:
+      product: herdr-mirror
+      # github.workflow_sha would check out the fork, not the central tools.
+      tool_ref: 'f4544112008a40ad8cb708e56f89a4587da7a20b'
