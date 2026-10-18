@@ -1,7 +1,7 @@
 name: Maintained Herdr mirror validation
 
 # Install as .github/workflows/maintenance-check.yml in neuralyze/herdr-mirror
-# after rendering both f4544112008a40ad8cb708e56f89a4587da7a20b values to one trusted 40-hex tool commit.
+# after pinning both reuse and tool checkout to one trusted 40-hex tool commit.
 # The updater dispatches this file at its candidate branch independently of
 # GITHUB_TOKEN-created PR event behavior. No credentials/secrets are inherited.
 on:
@@ -17,9 +17,9 @@ permissions:
 jobs:
   check:
     if: github.repository == 'neuralyze/herdr-mirror'
-    uses: neuralyze/herdr-maintenance/.github/workflows/component-check.yml@f4544112008a40ad8cb708e56f89a4587da7a20b
+    uses: neuralyze/herdr-maintenance/.github/workflows/component-check.yml@37bb948a0ea8aa0f8ddd02f609d5ddcf42e05d97
     with:
       product: herdr-mirror
       source_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       # github.workflow_sha is this caller, NOT the reusable tool commit.
-      tool_ref: 'f4544112008a40ad8cb708e56f89a4587da7a20b'
+      tool_ref: '37bb948a0ea8aa0f8ddd02f609d5ddcf42e05d97'
