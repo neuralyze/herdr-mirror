@@ -141,7 +141,9 @@ live regardless of what any stream is doing.
 
 **Light on the machines it mirrors** — an unreachable host is retried after
 5 s, doubling to every 5 minutes, and its error is logged once an hour rather
-than per retry.
+than per retry. A host that answers while its herdr is restarting or stopped
+is retried every 2 s for up to 3 minutes, so a restarted server is mirrored
+again within seconds.
 
 ### Keybinds
 
