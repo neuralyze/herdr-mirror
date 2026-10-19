@@ -139,6 +139,12 @@ blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
 
+**Light on the machines it mirrors** — the daemon only tells the local herdr
+what changed: an unchanged status, token set or split layout is not re-sent
+(everything is re-sent once every 10 minutes, and after the local server
+restarts or the connection drops). A local close, rename or resize pokes only
+the host that owns the mirror.
+
 **Remote titles** — a mirror pane takes its remote pane's live terminal title
 as its own, so herdr's `terminal_title` for the mirror (and anything that names
 panes by it — `herdr pane list`, other herdr clients) reads what the remote
