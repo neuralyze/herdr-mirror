@@ -154,7 +154,9 @@ set or split layout is not re-sent (everything is re-sent once every 10
 minutes, and after the local server restarts or the connection drops). A
 local close, rename or resize pokes only the host that owns the mirror. An
 unreachable host is retried after 5 s, doubling to every 5 minutes, and its
-error is logged once an hour rather than per retry.
+error is logged once an hour rather than per retry. A host that answers while
+its herdr is restarting or stopped is retried every 2 s for up to 3 minutes,
+so a restarted server is mirrored again within seconds.
 
 **Remote titles** — a mirror pane takes its remote pane's live terminal title
 as its own, so herdr's `terminal_title` for the mirror (and anything that names
