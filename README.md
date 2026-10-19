@@ -88,7 +88,10 @@ remote, tmux-style; the mouse wheel scrolls remote scrollback.
 **Watch-only** — for a machine with its own display or a human sitting at it,
 set `always_control = false` (globally or per host). Its mirrors become
 read-only: a live view with zero effect on the remote that escalates to control
-when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
+when you type and auto-releases after 30 s idle (`ctrl+\` releases
+immediately). Taking control happens on the pane's existing connection — no
+new ssh, the view keeps streaming — and attaches at the remote pane's own
+size, so typing never resizes the remote.
 
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
 pane/tab/workspace on the remote (`close_remote_on_local_close`; set it false to
@@ -135,9 +138,23 @@ installed on whichever end runs it. See
 
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
-blank and a busy pane can't contend with or drop another's stream. Sidebar
-agent status is daemon-driven, not stream-derived, so every agent's state stays
-live regardless of what any stream is doing.
+blank and a busy pane can't contend with or drop another's stream. Output is
+painted at most ~20 times a second, latest screen wins: a fast-scrolling remote
+costs the local pane one repaint per interval, and a local pane that stops
+draining never stalls the stream, input, or signals — it simply gets the
+newest screen once it drains. Sidebar agent status is daemon-driven, not
+stream-derived, so every agent's state stays live regardless of what any
+stream is doing.
+
+**Light on the machines it mirrors** — agent status comes from one
+`agent.list` per host every 2 s, not from a subscription per pane (herdr
+serves those by polling its app thread ten times a second per pane). The
+daemon only tells the local herdr what changed: an unchanged status, token
+set or split layout is not re-sent (everything is re-sent once every 10
+minutes, and after the local server restarts or the connection drops). A
+local close, rename or resize pokes only the host that owns the mirror. An
+unreachable host is retried after 5 s, doubling to every 5 minutes, and its
+error is logged once an hour rather than per retry.
 
 **Remote titles** — a mirror pane takes its remote pane's live terminal title
 as its own, so herdr's `terminal_title` for the mirror (and anything that names
@@ -321,6 +338,10 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# compression = true     # default. ssh Compression for every pane stream and
+                         # the daemon's connection. Set on the command line, so
+                         # it beats `Compression no` in ~/.ssh/config; set
+                         # false here (globally or per host) to turn it off.
 
 [hosts.work]
 target = "work"
@@ -338,6 +359,7 @@ target = "work"
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
                                      # auto = socket, falling back to exec.
+# compression = false                # per-host override of the global default
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
@@ -427,6 +449,17 @@ identified as disposable merely because their directory matches.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
+- **Agent status lags by up to ~2 s** — it is polled (`agent.list`) rather than
+  subscribed per pane, because herdr serves per-pane status subscriptions by
+  polling its app thread 10×/s per pane. An agent appearing or leaving is
+  noticed at once (`pane.agent_detected`); its later state changes on the next
+  poll.
+- **While you hold control of a watch-only mirror, the remote can't resize that
+  pane** — herdr locks a terminal's size to its attached controller. Control
+  attaches at the pane's current size and releases after 30 s idle (or
+  `ctrl+\`), when the remote's own layout applies again. A remote whose pty
+  can't be measured (`herdr pane process-info` + `stty size`) falls back to
+  this pane's size and says so.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real

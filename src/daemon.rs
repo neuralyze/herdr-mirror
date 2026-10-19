@@ -28,10 +28,10 @@ use tokio::time::Instant;
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
-    apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    relay_pane_title, teardown, AgentInfo, ConvergeDeps,
+    apply_remote_closes, bump_local_epoch, converge, fetch_agents, mark_unknown, mirror_source,
+    new_reports, push_statuses, regroup_sidebar, relay_pane_title, teardown, ConvergeDeps,
 };
-use crate::state::{load_state, save_state, HostState};
+use crate::state::{load_state, save_state};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
 
 // --- pidfile / pause marker ---
@@ -165,6 +165,9 @@ struct HostCtx {
     closes: crate::closes::Closes,
 }
 
+/// Remote events, all broadcast (no `pane_id`). Every one of these is served
+/// from herdr's in-memory event ring: subscribing costs the remote nothing per
+/// pane.
 const BROADCAST_SUBS: &[&str] = &[
     "workspace.created",
     "workspace.renamed",
@@ -175,10 +178,11 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
+    // an agent appearing or leaving: answered with an immediate status poll,
+    // not a converge — nothing structural changed
     "pane.agent_detected",
     // a bare remote resize (no pane created/closed) has no other event to
-    // hang a converge off of; falls into the generic converge_at branch below
-    // like any subscription this daemon doesn't special-case.
+    // hang a converge off of
     "layout.updated",
 ];
 
@@ -189,12 +193,31 @@ const BROADCAST_SUBS: &[&str] = &[
 const TITLE_SUB: &str = "pane.updated";
 const TITLE_COALESCE: Duration = Duration::from_secs(1);
 
-fn sub_list(pane_ids: &[String], titles: bool) -> Vec<Value> {
+/// Agent status is polled with one `agent.list` per host, not subscribed per
+/// pane. herdr 0.9.0 has no broadcast form of `pane.agent_status_changed` (the
+/// subscription requires a `pane_id`), and it serves each such subscription by
+/// polling: every 100 ms in which no event arrived, the subscription thread
+/// makes a blocking `pane.get` round trip into the server's single app thread
+/// (`src/api/subscriptions.rs`, `ActiveAgentStatusChangedSubscription::
+/// poll_result`; `src/api/server.rs` `CONNECTION_POLL_INTERVAL`). Mirroring N
+/// panes therefore cost every remote N x 10 app-thread requests a second, idle
+/// or not. This is one request per host per interval.
+const STATUS_POLL: Duration = Duration::from_secs(2);
+/// Delay before the status poll an agent-detection event asks for, so a burst
+/// (an agent's launcher, then the agent) is one poll.
+const STATUS_NUDGE: Duration = Duration::from_millis(150);
+
+/// Debounce for a converge after a structural remote event.
+const CONVERGE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Longer for a bare remote resize: dragging a split emits a stream of these,
+/// and only where it stopped matters.
+const LAYOUT_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+fn sub_list(titles: bool) -> Vec<Value> {
     let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
     if titles {
         subs.push(json!({ "type": TITLE_SUB }));
     }
-    subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
     subs
 }
 
@@ -208,14 +231,9 @@ fn rejects_title_events(err: &str) -> bool {
 /// Subscribe with live title events while the remote accepts them. An older
 /// remote gets the same subscription without them, and its mirrors' titles
 /// follow each converge, instead of losing every other event along with them.
-async fn subscribe(
-    ctx: &HostCtx,
-    remote: &ApiClient,
-    pane_ids: &[String],
-    titles: &mut bool,
-) -> Result<EventStream> {
+async fn subscribe(ctx: &HostCtx, remote: &ApiClient, titles: &mut bool) -> Result<EventStream> {
     if *titles {
-        match remote.subscribe(sub_list(pane_ids, true)).await {
+        match remote.subscribe(sub_list(true)).await {
             Ok(s) => return Ok(s),
             Err(e) if rejects_title_events(&e.to_string()) => {
                 *titles = false;
@@ -227,71 +245,40 @@ async fn subscribe(
             Err(e) => return Err(e),
         }
     }
-    remote.subscribe(sub_list(pane_ids, false)).await
+    remote.subscribe(sub_list(false)).await
 }
 
-/// Broadcast structure/lifecycle events + per-pane agent-status subscriptions
-/// (pane.agent_status_changed requires a pane_id). A rejected pane
-/// subscription degrades to broadcast-only instead of killing the connection.
-async fn resubscribe(
-    ctx: &HostCtx,
-    remote: &ApiClient,
-    stream: &mut EventStream,
-    subscribed_key: &mut String,
-    state: &HostState,
-    titles: &mut bool,
-) -> Result<()> {
-    // live panes only: tombstoned mirrors' statuses are moot
-    let mut pane_ids: Vec<String> = state
-        .panes
-        .iter()
-        .filter(|(_, e)| !e.is_tombstoned())
-        .map(|(rid, _)| rid.clone())
-        .collect();
-    pane_ids.sort();
-    let key = pane_ids.join(",");
-    if key == *subscribed_key {
+/// Earliest of `current` and `at`: a sooner request wins, a later one never
+/// postpones what is already scheduled.
+fn schedule(current: &mut Option<Instant>, at: Instant) {
+    if current.is_none_or(|t| at < t) {
+        *current = Some(at);
+    }
+}
+
+/// Status poll: one `agent.list`, pushed through the change-detecting reporter
+/// so only mirrors whose remote agent actually changed cost the hub anything.
+async fn poll_status(ctx: &HostCtx, deps: &ConvergeDeps) -> Result<()> {
+    // a hidden host's mirrors are gone locally; keep it quiet
+    if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
         return Ok(());
     }
-    match subscribe(ctx, remote, &pane_ids, titles).await {
-        Ok(s) => {
-            *stream = s;
-            *subscribed_key = key;
-            Ok(())
-        }
-        Err(e) => {
-            ctx.log.log(&format!(
-                "[{}] pane subscriptions rejected ({e}) — broadcast only",
-                ctx.host.name
-            ));
-            *stream = subscribe(ctx, remote, &[], titles).await?;
-            *subscribed_key = "<broadcast>".into();
-            Ok(())
-        }
-    }
-}
-
-/// Fast-path: apply coalesced status updates without a remote snapshot.
-/// Returns true if an event referenced a pane we don't mirror yet.
-async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
+    let agents = fetch_agents(&deps.remote).await?;
     let mut state = load_state(&ctx.env_state_dir, &ctx.host.name);
-    let mut need_converge = false;
-    for (remote_id, data) in pending {
-        let Some(entry) = state.panes.get_mut(&remote_id) else {
-            need_converge = true; // unknown pane → let a full pass create it
-            continue;
-        };
-        if entry.is_tombstoned() {
-            continue; // user closed this mirror — its statuses are moot
+    let sent = push_statuses(&ctx.local, &deps.reports, &ctx.host.name, &ctx.log, &agents, &mut state).await;
+    // titles ride along for agent panes (the poll already has them); a remote
+    // without `pane.updated` gets its agent titles every poll this way
+    for a in &agents {
+        if let Some(entry) = state.panes.get(&a.pane_id) {
+            relay_pane_title(&ctx.env_state_dir, &ctx.host.name, &a.pane_id, entry, a.terminal_title.as_deref());
         }
-        let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
-        let agent = info.has_agent().then_some(&info);
-        push_pane_status(&ctx.local, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
     }
-    if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
-        ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
+    if sent {
+        if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
+            ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
+        }
     }
-    need_converge
+    Ok(())
 }
 
 /// Title fast-path: relay coalesced `pane.updated` titles without a snapshot.
@@ -336,13 +323,15 @@ fn remember_transport(
 }
 
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
-/// until the connection drops (returns Err).
+/// until the connection drops (returns Err). `connected` is set once the remote
+/// answered, so the caller knows whether this failure ended a live connection.
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
+    connected: &mut bool,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -353,6 +342,7 @@ async fn run_connected(
     let (remote, _status) = remote_host.connect_api().await?;
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
+    *connected = true;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
         remote: remote.clone(),
@@ -361,39 +351,33 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
+        // fresh per connection: `mark_unknown` overwrote everything on the way
+        // down, so the first pass after a reconnect must send it all again
+        reports: new_reports(),
     };
     // whether this remote publishes pane.updated; settled by the first subscribe
     let mut title_events = true;
-    // broadcast-only first: subscribing a since-dead pane id is rejected, so
-    // converge must prune the map before the per-pane upgrade
-    let mut stream = subscribe(ctx, &remote, &[], &mut title_events).await?;
-    let mut subscribed_key = String::from("<broadcast>");
-    let state = converge(&deps).await?;
-    resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state, &mut title_events).await?;
+    let mut stream = subscribe(ctx, &remote, &mut title_events).await?;
+    converge(&deps).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
     let mut converge_at: Option<Instant> = None;
-    let mut status_at: Option<Instant> = None;
+    let mut status_at: Option<Instant> = Some(Instant::now() + STATUS_POLL);
     let mut closes_at: Option<Instant> = None;
     let mut titles_at: Option<Instant> = None;
-    let mut pending_status: HashMap<String, Value> = HashMap::new();
     let mut pending_closes: Vec<String> = Vec::new();
     let mut pending_titles: HashMap<String, Option<String>> = HashMap::new();
+    let mut status_failing = false;
 
     loop {
         let sleep = sleep_until_earliest([converge_at, status_at, closes_at, titles_at]);
         tokio::select! {
             ev = stream.next() => {
+                let now = Instant::now();
                 match ev {
                     None => return Err(err("event stream closed")),
-                    // status changes take the fast-path; structure changes
-                    // need a full reconcile (debounced 500ms)
-                    Some(e) if e.event == "pane_agent_status_changed" => {
-                        if let Some(pid) = e.data.get("pane_id").and_then(|v| v.as_str()) {
-                            // coalesce: keep only the latest per pane
-                            pending_status.insert(pid.to_string(), e.data.clone());
-                            status_at.get_or_insert(Instant::now() + Duration::from_millis(150));
-                        }
+                    Some(e) if e.event == "pane_agent_detected" => {
+                        schedule(&mut status_at, now + STATUS_NUDGE);
                     }
                     // explicit remote closes are authoritative: remove the mirror
                     // directly instead of inferring it from snapshot absence
@@ -405,7 +389,7 @@ async fn run_connected(
                         };
                         if let Some(rid) = e.data.get(key).and_then(|v| v.as_str()) {
                             pending_closes.push(rid.to_string());
-                            closes_at.get_or_insert(Instant::now() + Duration::from_millis(150));
+                            closes_at.get_or_insert(now + Duration::from_millis(150));
                         }
                     }
                     // title changes: coalesced per pane and relayed to the
@@ -419,33 +403,28 @@ async fn run_connected(
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
                             pending_titles.insert(pid.to_string(), title);
-                            titles_at.get_or_insert(Instant::now() + TITLE_COALESCE);
+                            titles_at.get_or_insert(now + TITLE_COALESCE);
                         }
                     }
+                    Some(e) if e.event == "layout_updated" => {
+                        schedule(&mut converge_at, now + LAYOUT_DEBOUNCE);
+                    }
                     Some(_) => {
-                        converge_at.get_or_insert(Instant::now() + Duration::from_millis(500));
+                        schedule(&mut converge_at, now + CONVERGE_DEBOUNCE);
                     }
                 }
             }
             Some(()) = poke.recv() => {
-                converge_at.get_or_insert(Instant::now());
+                converge_at = Some(Instant::now());
             }
             _ = sleep => {
                 let now = Instant::now();
-                if status_at.is_some_and(|t| t <= now) {
-                    status_at = None;
-                    let pending = std::mem::take(&mut pending_status);
-                    if flush_status(ctx, pending).await {
-                        // unknown pane → let a full pass create it
-                        converge_at.get_or_insert(now);
-                    }
-                }
                 if closes_at.is_some_and(|t| t <= now) {
                     closes_at = None;
                     let closed = std::mem::take(&mut pending_closes);
                     apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
-                    // reconcile + refresh subscriptions after the removals
-                    converge_at.get_or_insert(now);
+                    // reconcile after the removals
+                    converge_at = Some(now);
                 }
                 if titles_at.is_some_and(|t| t <= now) {
                     titles_at = None;
@@ -463,9 +442,21 @@ async fn run_connected(
                         &ctx.closes,
                     )
                     .await;
-                    let state = converge(&deps).await?;
-                    // pane set may have changed
-                    resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state, &mut title_events).await?;
+                    converge(&deps).await?;
+                }
+                if status_at.is_some_and(|t| t <= now) {
+                    match poll_status(ctx, &deps).await {
+                        Ok(()) => status_failing = false,
+                        // the event stream is what decides the connection is
+                        // gone; one slow answer is not worth a reconnect
+                        Err(e) => {
+                            if !status_failing {
+                                ctx.log.log(&format!("[{}] status poll failed: {e}", ctx.host.name));
+                            }
+                            status_failing = true;
+                        }
+                    }
+                    status_at = Some(Instant::now() + STATUS_POLL);
                 }
             }
         }
@@ -474,20 +465,43 @@ async fn run_connected(
 
 /// Retry pacing after a lost connection.
 ///
-/// ssh keeps its original ladder: an unreachable machine is a fault, and you
-/// want it back fast. A stopped container is not a fault, it is the resting
-/// state, so retrying every 30s forever would burn a `docker ps` per host per
-/// half-minute and fill the log with non-events.
-const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
+/// An unreachable machine backs off exponentially from 5 s to 5 min: the first
+/// retries come quickly (a blip, a reboot), and a machine that is simply off
+/// costs one dial every 5 min instead of two ssh spawns every 31 s forever. A
+/// stopped container is not a fault, it is the resting state, and waits the
+/// dormant interval from the start.
+const RECONNECT_FIRST: u64 = 5;
+const RECONNECT_MAX: u64 = 300;
 const DORMANT_DELAY: u64 = 300;
+
+fn reconnect_delay(attempt: usize) -> u64 {
+    RECONNECT_FIRST
+        .saturating_mul(1u64 << attempt.min(16))
+        .min(RECONNECT_MAX)
+}
+
+/// A repeat of the error last logged stays quiet for this long.
+const RETRY_LOG_QUIET: Duration = Duration::from_secs(3600);
+
+/// Is this failed dial worth a log line? The first of a streak, an error that
+/// differs from the one last logged, or the same one an hour on — so a host
+/// that is off is one line an hour, not one per retry.
+fn retry_log_due(last: Option<&(String, Instant)>, error: &str, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some((logged, at)) => logged != error || now.duration_since(*at) >= RETRY_LOG_QUIET,
+    }
+}
 
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
-    let mut was_dormant = false;
     // persists across reconnects for the daemon's whole lifetime — the
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
+    // the error last logged for this host's failure streak, and when
+    let mut last_logged: Option<(String, Instant)> = None;
+    let mut failures = 0u64;
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -501,51 +515,61 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &ctx.closes,
         )
         .await;
+        let mut connected = false;
         let e = match run_connected(
             &ctx,
             &mut poke,
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
+            &mut connected,
         )
         .await
         {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
-        mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
-            .await;
+        if connected {
+            last_logged = None;
+            failures = 0;
+        }
+        // Once per outage: when a live connection ends, and on the first failed
+        // dial after startup (a previous daemon may have left these mirrors
+        // claiming a state nobody is updating). Every failed redial after that
+        // would only re-send the same "unknown".
+        if failures == 0 {
+            mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost").await;
+        }
+        failures += 1;
         // starts_with, not contains: the marker is always emitted as a prefix,
         // while the error text can embed user strings (target, remote_bin). A
         // substring test would make an ssh host named `dormant-box` back off
-        // for 5 minutes and stop logging on every genuine failure.
-        let dormant = e.to_string().starts_with(crate::remote::DORMANT);
-        let delay = if dormant {
-            DORMANT_DELAY
-        } else {
-            RECONNECT_DELAYS[backoff_idx.min(RECONNECT_DELAYS.len() - 1)]
-        };
+        // for 5 minutes on every genuine failure.
+        let text = e.to_string();
+        let dormant = text.starts_with(crate::remote::DORMANT);
+        let delay = if dormant { DORMANT_DELAY } else { reconnect_delay(backoff_idx) };
         // dormant cycles must not advance the ladder they do not use: a
-        // container stopped overnight would otherwise leave backoff_idx pinned
-        // at the 30s rung, so the first real failure while it boots waits 30s
-        // instead of the 5s the ladder exists to give.
+        // container stopped overnight would otherwise leave the next real
+        // failure while it boots waiting 5 minutes instead of 5 seconds.
         if !dormant {
             backoff_idx += 1;
         }
-        // log dormancy once on entry, not on every poll of a stopped container
-        if !dormant || !was_dormant {
-            ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+        let now = Instant::now();
+        if retry_log_due(last_logged.as_ref(), &text, now) {
+            let streak = if failures > 1 { format!(", attempt {failures}") } else { String::new() };
+            ctx.log.log(&format!(
+                "[{}] disconnected ({text}) — retrying in {delay}s{streak}; repeats of this error are logged hourly",
+                ctx.host.name
+            ));
+            last_logged = Some((text, now));
         }
-        was_dormant = dormant;
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
         // about now, and honouring them would skip the sleep entirely
         while poke.try_recv().is_ok() {}
         // Wake early only for a hidden host, whose close is genuinely waiting on
-        // us and would otherwise sit behind a 300s dormant sleep. Every other
-        // poke is ordinary local traffic — `local_events_task` fans one out to
-        // every host on every event, `layout.updated` included, so treating them
-        // all as urgent collapses the reconnect ladder and burns a dial (or a
-        // `docker ps`) per split drag.
+        // us and would otherwise sit behind a long sleep. Every other poke is
+        // ordinary local traffic, and treating them as urgent collapses the
+        // backoff and burns a dial (or a `docker ps`) per poke.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(delay);
         loop {
             tokio::select! {
@@ -661,8 +685,41 @@ async fn heal_zombie_mirrors(
     }
 }
 
-// Local events: mirror closes drive tombstoning — poke every host so the
-/// next converge records the user's intent promptly.
+/// The local object a hub event is about, when it can concern a mirror: the
+/// id whose owning host must reconcile. `None` for events no host acts on.
+fn local_event_target(event: &str, data: &Value) -> Option<String> {
+    let id = match event {
+        "workspace_closed" => data.get("workspace_id"),
+        "pane_closed" => data.get("pane_id"),
+        "tab_closed" | "tab_renamed" => data.get("tab_id"),
+        // `layout.updated` carries the whole layout of the tab that changed
+        "layout_updated" => data.pointer("/layout/tab_id").or_else(|| data.get("tab_id")),
+        _ => None,
+    };
+    id.and_then(Value::as_str).map(str::to_string)
+}
+
+/// Indices of the hosts whose id map holds `local_id`. herdr ids are unique per
+/// server, so this is at most one host in practice; an unmapped id (a local,
+/// non-mirror object) is none.
+fn owning_hosts(state_dir: &std::path::Path, hosts: &[HostConfig], local_id: &str) -> Vec<usize> {
+    hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| {
+            let s = load_state(state_dir, &h.name);
+            s.workspaces.values().any(|e| e.local_id == local_id)
+                || s.tabs.values().any(|e| e.local_id == local_id)
+                || s.panes.values().any(|e| e.local_id == local_id)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Local events: a close, rename or resize of a mirror pokes the host that
+/// owns it, so its next converge records the user's intent promptly. Only that
+/// host: the operator's own resizes and closes elsewhere on the hub used to
+/// make every host take two snapshots per event.
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
@@ -692,6 +749,9 @@ async fn local_events_task(
         ];
         match local.subscribe(subs).await {
             Ok(mut stream) => {
+                // the server may have restarted since anything was reported to
+                // it: every host re-sends its reports on the next pass
+                bump_local_epoch();
                 // catch a sidebar left ungrouped from a previous run
                 regroup_sidebar(&local, &prefixes, &log).await;
                 // subscribe succeeding after a drop = the server is back up;
@@ -715,11 +775,16 @@ async fn local_events_task(
                             }
                         }
                     }
-                    for p in &pokers {
-                        let _ = p.try_send(());
+                    if let Some(id) = local_event_target(&e.event, &e.data) {
+                        for i in owning_hosts(&state_dir, &hosts, &id) {
+                            let _ = pokers[i].try_send(());
+                        }
                     }
-                    // a workspace appeared/left — keep hosts grouped (no-op if already)
-                    regroup_sidebar(&local, &prefixes, &log).await;
+                    // only a workspace appearing or leaving can ungroup the
+                    // sidebar (no-op if already grouped)
+                    if matches!(e.event.as_str(), "workspace_created" | "workspace_closed") {
+                        regroup_sidebar(&local, &prefixes, &log).await;
+                    }
                 }
                 log.log("local event stream dropped — resubscribing");
             }
@@ -1008,6 +1073,8 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
+            // one pass: nothing was sent before it, so everything is sent
+            reports: new_reports(),
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
@@ -1098,18 +1165,95 @@ mod tests {
 
     /// Detection is a separate lifecycle event from later status changes. If
     /// this broadcast subscription disappears, a newly detected agent can sit
-    /// stale until the periodic poll even though its pane is already mirrored.
+    /// stale until the next status poll even though its pane is mirrored.
+    ///
+    /// And no subscription may name a pane: herdr 0.9.0 serves every
+    /// `pane.agent_status_changed{pane_id}` by polling `pane.get` into its app
+    /// thread ten times a second, which is the load this daemon must not put on
+    /// the machines it mirrors. Status comes from the `agent.list` poll.
     #[test]
-    fn subscriptions_include_explicit_agent_detection() {
+    fn subscriptions_are_broadcast_only() {
         for titles in [true, false] {
-            let subs = sub_list(&["w1:p1".to_string()], titles);
-
+            let subs = sub_list(titles);
             assert!(subs.contains(&json!({ "type": "pane.agent_detected" })));
-            assert!(subs.contains(&json!({
-                "type": "pane.agent_status_changed",
-                "pane_id": "w1:p1",
-            })));
+            for s in &subs {
+                assert!(s.get("pane_id").is_none(), "per-pane subscription: {s}");
+                assert_ne!(s["type"], "pane.agent_status_changed");
+                assert_ne!(s["type"], "pane.output_matched");
+                assert_ne!(s["type"], "pane.scroll_changed");
+            }
         }
+    }
+
+    /// Unreachable hosts back off 5 s doubling to a 5 min ceiling, and stay
+    /// there however long the outage lasts.
+    #[test]
+    fn unreachable_hosts_back_off_exponentially_to_five_minutes() {
+        let ladder: Vec<u64> = (0..9).map(reconnect_delay).collect();
+        assert_eq!(ladder, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(reconnect_delay(10_000), 300);
+        // a day at the ceiling is 288 dials, where the old 30 s rung was 2880
+        let day: u64 = (0..400).map(reconnect_delay).scan(0u64, |t, d| { *t += d; Some(*t) })
+            .take_while(|t| *t <= 86_400).count() as u64;
+        assert!(day < 300, "{day} dials in a day");
+    }
+
+    /// A host that stays down logs its error once an hour, not per retry; a
+    /// different error is news and logs at once.
+    #[test]
+    fn a_repeated_dial_failure_is_logged_hourly() {
+        let t0 = Instant::now();
+        assert!(retry_log_due(None, "no route", t0));
+        let logged = ("no route".to_string(), t0);
+        assert!(!retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(300)));
+        assert!(!retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(3599)));
+        assert!(retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(3600)));
+        assert!(retry_log_due(Some(&logged), "auth failed", t0 + Duration::from_secs(1)));
+    }
+
+    /// A sooner request wins; a later one never postpones a scheduled one.
+    #[test]
+    fn scheduling_keeps_the_earliest_deadline() {
+        let t0 = Instant::now();
+        let mut at = None;
+        schedule(&mut at, t0 + Duration::from_secs(2));
+        schedule(&mut at, t0 + Duration::from_secs(5));
+        assert_eq!(at, Some(t0 + Duration::from_secs(2)));
+        schedule(&mut at, t0);
+        assert_eq!(at, Some(t0));
+    }
+
+    /// Hub events name the object a host would reconcile; everything else is
+    /// none of any host's business.
+    #[test]
+    fn local_events_name_the_object_to_route_by() {
+        let layout = json!({ "layout": { "tab_id": "w3:t2", "workspace_id": "w3", "panes": [] } });
+        assert_eq!(local_event_target("layout_updated", &layout).as_deref(), Some("w3:t2"));
+        assert_eq!(local_event_target("tab_renamed", &json!({ "tab_id": "w3:t1" })).as_deref(), Some("w3:t1"));
+        assert_eq!(local_event_target("pane_closed", &json!({ "pane_id": "w3:p1" })).as_deref(), Some("w3:p1"));
+        assert_eq!(local_event_target("workspace_closed", &json!({ "workspace_id": "w3" })).as_deref(), Some("w3"));
+        assert_eq!(local_event_target("workspace_created", &json!({ "workspace_id": "w4" })), None);
+    }
+
+    /// Only the host whose map holds the id is poked; a hub-only object pokes
+    /// nobody.
+    #[test]
+    fn local_events_poke_only_the_owning_host() {
+        let env = lock_test_env("owners");
+        let hosts: Vec<HostConfig> = crate::config::parse_config(
+            "[hosts.a]\ntarget = \"a\"\n[hosts.b]\ntarget = \"b\"\n",
+        )
+        .unwrap()
+        .hosts;
+        let mut b = crate::state::HostState::default();
+        b.tabs.insert(
+            "w1:t1".into(),
+            crate::state::TabEntry { local_id: "w9:t3".into(), last_remote_label: None },
+        );
+        save_state(&env.state_dir, "b", &b).unwrap();
+        assert_eq!(owning_hosts(&env.state_dir, &hosts, "w9:t3"), vec![1]);
+        assert!(owning_hosts(&env.state_dir, &hosts, "w2:t1").is_empty());
+        let _ = fs::remove_dir_all(&env.state_dir);
     }
 
     /// A remote that doesn't know `pane.updated` rejects the whole subscribe,
@@ -1120,8 +1264,8 @@ mod tests {
     #[test]
     fn title_events_are_dropped_only_for_a_remote_that_lacks_them() {
         let title_sub = json!({ "type": "pane.updated" });
-        assert!(sub_list(&[], true).contains(&title_sub));
-        assert!(!sub_list(&[], false).contains(&title_sub));
+        assert!(sub_list(true).contains(&title_sub));
+        assert!(!sub_list(false).contains(&title_sub));
 
         assert!(rejects_title_events(
             "events.subscribe: invalid request: unknown variant `pane.updated`, expected one of \
