@@ -277,13 +277,15 @@ fn remember_transport(
 }
 
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
-/// until the connection drops (returns Err).
+/// until the connection drops (returns Err). `connected` is set once the remote
+/// answered, so the caller knows whether this failure ended a live connection.
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
+    connected: &mut bool,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -294,6 +296,7 @@ async fn run_connected(
     let (remote, _status) = remote_host.connect_api().await?;
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
+    *connected = true;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
         remote: remote.clone(),
@@ -393,20 +396,43 @@ async fn run_connected(
 
 /// Retry pacing after a lost connection.
 ///
-/// ssh keeps its original ladder: an unreachable machine is a fault, and you
-/// want it back fast. A stopped container is not a fault, it is the resting
-/// state, so retrying every 30s forever would burn a `docker ps` per host per
-/// half-minute and fill the log with non-events.
-const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
+/// An unreachable machine backs off exponentially from 5 s to 5 min: the first
+/// retries come quickly (a blip, a reboot), and a machine that is simply off
+/// costs one dial every 5 min instead of two ssh spawns every 31 s forever. A
+/// stopped container is not a fault, it is the resting state, and waits the
+/// dormant interval from the start.
+const RECONNECT_FIRST: u64 = 5;
+const RECONNECT_MAX: u64 = 300;
 const DORMANT_DELAY: u64 = 300;
+
+fn reconnect_delay(attempt: usize) -> u64 {
+    RECONNECT_FIRST
+        .saturating_mul(1u64 << attempt.min(16))
+        .min(RECONNECT_MAX)
+}
+
+/// A repeat of the error last logged stays quiet for this long.
+const RETRY_LOG_QUIET: Duration = Duration::from_secs(3600);
+
+/// Is this failed dial worth a log line? The first of a streak, an error that
+/// differs from the one last logged, or the same one an hour on — so a host
+/// that is off is one line an hour, not one per retry.
+fn retry_log_due(last: Option<&(String, Instant)>, error: &str, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some((logged, at)) => logged != error || now.duration_since(*at) >= RETRY_LOG_QUIET,
+    }
+}
 
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
-    let mut was_dormant = false;
     // persists across reconnects for the daemon's whole lifetime — the
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
+    // the error last logged for this host's failure streak, and when
+    let mut last_logged: Option<(String, Instant)> = None;
+    let mut failures = 0u64;
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -420,51 +446,61 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &ctx.closes,
         )
         .await;
+        let mut connected = false;
         let e = match run_connected(
             &ctx,
             &mut poke,
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
+            &mut connected,
         )
         .await
         {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
-        mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
-            .await;
+        if connected {
+            last_logged = None;
+            failures = 0;
+        }
+        // Once per outage: when a live connection ends, and on the first failed
+        // dial after startup (a previous daemon may have left these mirrors
+        // claiming a state nobody is updating). Every failed redial after that
+        // would only re-send the same "unknown".
+        if failures == 0 {
+            mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost").await;
+        }
+        failures += 1;
         // starts_with, not contains: the marker is always emitted as a prefix,
         // while the error text can embed user strings (target, remote_bin). A
         // substring test would make an ssh host named `dormant-box` back off
-        // for 5 minutes and stop logging on every genuine failure.
-        let dormant = e.to_string().starts_with(crate::remote::DORMANT);
-        let delay = if dormant {
-            DORMANT_DELAY
-        } else {
-            RECONNECT_DELAYS[backoff_idx.min(RECONNECT_DELAYS.len() - 1)]
-        };
+        // for 5 minutes on every genuine failure.
+        let text = e.to_string();
+        let dormant = text.starts_with(crate::remote::DORMANT);
+        let delay = if dormant { DORMANT_DELAY } else { reconnect_delay(backoff_idx) };
         // dormant cycles must not advance the ladder they do not use: a
-        // container stopped overnight would otherwise leave backoff_idx pinned
-        // at the 30s rung, so the first real failure while it boots waits 30s
-        // instead of the 5s the ladder exists to give.
+        // container stopped overnight would otherwise leave the next real
+        // failure while it boots waiting 5 minutes instead of 5 seconds.
         if !dormant {
             backoff_idx += 1;
         }
-        // log dormancy once on entry, not on every poll of a stopped container
-        if !dormant || !was_dormant {
-            ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+        let now = Instant::now();
+        if retry_log_due(last_logged.as_ref(), &text, now) {
+            let streak = if failures > 1 { format!(", attempt {failures}") } else { String::new() };
+            ctx.log.log(&format!(
+                "[{}] disconnected ({text}) — retrying in {delay}s{streak}; repeats of this error are logged hourly",
+                ctx.host.name
+            ));
+            last_logged = Some((text, now));
         }
-        was_dormant = dormant;
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
         // about now, and honouring them would skip the sleep entirely
         while poke.try_recv().is_ok() {}
         // Wake early only for a hidden host, whose close is genuinely waiting on
-        // us and would otherwise sit behind a 300s dormant sleep. Every other
-        // poke is ordinary local traffic — `local_events_task` fans one out to
-        // every host on every event, `layout.updated` included, so treating them
-        // all as urgent collapses the reconnect ladder and burns a dial (or a
-        // `docker ps`) per split drag.
+        // us and would otherwise sit behind a long sleep. Every other poke is
+        // ordinary local traffic, and treating them as urgent collapses the
+        // backoff and burns a dial (or a `docker ps`) per poke.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(delay);
         loop {
             tokio::select! {
@@ -1027,6 +1063,32 @@ mod tests {
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1",
         })));
+    }
+
+    /// Unreachable hosts back off 5 s doubling to a 5 min ceiling, and stay
+    /// there however long the outage lasts.
+    #[test]
+    fn unreachable_hosts_back_off_exponentially_to_five_minutes() {
+        let ladder: Vec<u64> = (0..9).map(reconnect_delay).collect();
+        assert_eq!(ladder, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(reconnect_delay(10_000), 300);
+        // a day at the ceiling is 288 dials, where the old 30 s rung was 2880
+        let day: u64 = (0..400).map(reconnect_delay).scan(0u64, |t, d| { *t += d; Some(*t) })
+            .take_while(|t| *t <= 86_400).count() as u64;
+        assert!(day < 300, "{day} dials in a day");
+    }
+
+    /// A host that stays down logs its error once an hour, not per retry; a
+    /// different error is news and logs at once.
+    #[test]
+    fn a_repeated_dial_failure_is_logged_hourly() {
+        let t0 = Instant::now();
+        assert!(retry_log_due(None, "no route", t0));
+        let logged = ("no route".to_string(), t0);
+        assert!(!retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(300)));
+        assert!(!retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(3599)));
+        assert!(retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(3600)));
+        assert!(retry_log_due(Some(&logged), "auth failed", t0 + Duration::from_secs(1)));
     }
 
     fn lock_test_env(tag: &str) -> Env {
