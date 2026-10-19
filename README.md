@@ -139,11 +139,13 @@ blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
 
-**Light on the machines it mirrors** — the daemon only tells the local herdr
-what changed: an unchanged status, token set or split layout is not re-sent
-(everything is re-sent once every 10 minutes, and after the local server
-restarts or the connection drops). A local close, rename or resize pokes only
-the host that owns the mirror.
+**Light on the machines it mirrors** — agent status comes from one
+`agent.list` per host every 2 s, not from a subscription per pane (herdr
+serves those by polling its app thread ten times a second per pane). The
+daemon only tells the local herdr what changed: an unchanged status, token
+set or split layout is not re-sent (everything is re-sent once every 10
+minutes, and after the local server restarts or the connection drops). A
+local close, rename or resize pokes only the host that owns the mirror.
 
 **Remote titles** — a mirror pane takes its remote pane's live terminal title
 as its own, so herdr's `terminal_title` for the mirror (and anything that names
@@ -433,6 +435,11 @@ identified as disposable merely because their directory matches.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
+- **Agent status lags by up to ~2 s** — it is polled (`agent.list`) rather than
+  subscribed per pane, because herdr serves per-pane status subscriptions by
+  polling its app thread 10×/s per pane. An agent appearing or leaving is
+  noticed at once (`pane.agent_detected`); its later state changes on the next
+  poll.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real

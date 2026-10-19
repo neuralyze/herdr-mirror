@@ -28,10 +28,10 @@ use tokio::time::Instant;
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
-    apply_remote_closes, bump_local_epoch, converge, mark_unknown, mirror_source, new_reports,
-    push_pane_status, regroup_sidebar, relay_pane_title, teardown, AgentInfo, ConvergeDeps, Reports,
+    apply_remote_closes, bump_local_epoch, converge, fetch_agents, mark_unknown, mirror_source,
+    new_reports, push_statuses, regroup_sidebar, relay_pane_title, teardown, ConvergeDeps,
 };
-use crate::state::{load_state, save_state, HostState};
+use crate::state::{load_state, save_state};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
 
 // --- pidfile / pause marker ---
@@ -165,6 +165,9 @@ struct HostCtx {
     closes: crate::closes::Closes,
 }
 
+/// Remote events, all broadcast (no `pane_id`). Every one of these is served
+/// from herdr's in-memory event ring: subscribing costs the remote nothing per
+/// pane.
 const BROADCAST_SUBS: &[&str] = &[
     "workspace.created",
     "workspace.renamed",
@@ -175,6 +178,8 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
+    // an agent appearing or leaving: answered with an immediate status poll,
+    // not a converge — nothing structural changed
     "pane.agent_detected",
     // a bare remote resize (no pane created/closed) has no other event to
     // hang a converge off of
@@ -188,18 +193,31 @@ const BROADCAST_SUBS: &[&str] = &[
 const TITLE_SUB: &str = "pane.updated";
 const TITLE_COALESCE: Duration = Duration::from_secs(1);
 
+/// Agent status is polled with one `agent.list` per host, not subscribed per
+/// pane. herdr 0.9.0 has no broadcast form of `pane.agent_status_changed` (the
+/// subscription requires a `pane_id`), and it serves each such subscription by
+/// polling: every 100 ms in which no event arrived, the subscription thread
+/// makes a blocking `pane.get` round trip into the server's single app thread
+/// (`src/api/subscriptions.rs`, `ActiveAgentStatusChangedSubscription::
+/// poll_result`; `src/api/server.rs` `CONNECTION_POLL_INTERVAL`). Mirroring N
+/// panes therefore cost every remote N x 10 app-thread requests a second, idle
+/// or not. This is one request per host per interval.
+const STATUS_POLL: Duration = Duration::from_secs(2);
+/// Delay before the status poll an agent-detection event asks for, so a burst
+/// (an agent's launcher, then the agent) is one poll.
+const STATUS_NUDGE: Duration = Duration::from_millis(150);
+
 /// Debounce for a converge after a structural remote event.
 const CONVERGE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Longer for a bare remote resize: dragging a split emits a stream of these,
 /// and only where it stopped matters.
 const LAYOUT_DEBOUNCE: Duration = Duration::from_millis(1500);
 
-fn sub_list(pane_ids: &[String], titles: bool) -> Vec<Value> {
+fn sub_list(titles: bool) -> Vec<Value> {
     let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
     if titles {
         subs.push(json!({ "type": TITLE_SUB }));
     }
-    subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
     subs
 }
 
@@ -213,14 +231,9 @@ fn rejects_title_events(err: &str) -> bool {
 /// Subscribe with live title events while the remote accepts them. An older
 /// remote gets the same subscription without them, and its mirrors' titles
 /// follow each converge, instead of losing every other event along with them.
-async fn subscribe(
-    ctx: &HostCtx,
-    remote: &ApiClient,
-    pane_ids: &[String],
-    titles: &mut bool,
-) -> Result<EventStream> {
+async fn subscribe(ctx: &HostCtx, remote: &ApiClient, titles: &mut bool) -> Result<EventStream> {
     if *titles {
-        match remote.subscribe(sub_list(pane_ids, true)).await {
+        match remote.subscribe(sub_list(true)).await {
             Ok(s) => return Ok(s),
             Err(e) if rejects_title_events(&e.to_string()) => {
                 *titles = false;
@@ -232,7 +245,7 @@ async fn subscribe(
             Err(e) => return Err(e),
         }
     }
-    remote.subscribe(sub_list(pane_ids, false)).await
+    remote.subscribe(sub_list(false)).await
 }
 
 /// Earliest of `current` and `at`: a sooner request wins, a later one never
@@ -243,69 +256,29 @@ fn schedule(current: &mut Option<Instant>, at: Instant) {
     }
 }
 
-/// Broadcast structure/lifecycle events + per-pane agent-status subscriptions
-/// (pane.agent_status_changed requires a pane_id). A rejected pane
-/// subscription degrades to broadcast-only instead of killing the connection.
-async fn resubscribe(
-    ctx: &HostCtx,
-    remote: &ApiClient,
-    stream: &mut EventStream,
-    subscribed_key: &mut String,
-    state: &HostState,
-    titles: &mut bool,
-) -> Result<()> {
-    // live panes only: tombstoned mirrors' statuses are moot
-    let mut pane_ids: Vec<String> = state
-        .panes
-        .iter()
-        .filter(|(_, e)| !e.is_tombstoned())
-        .map(|(rid, _)| rid.clone())
-        .collect();
-    pane_ids.sort();
-    let key = pane_ids.join(",");
-    if key == *subscribed_key {
+/// Status poll: one `agent.list`, pushed through the change-detecting reporter
+/// so only mirrors whose remote agent actually changed cost the hub anything.
+async fn poll_status(ctx: &HostCtx, deps: &ConvergeDeps) -> Result<()> {
+    // a hidden host's mirrors are gone locally; keep it quiet
+    if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
         return Ok(());
     }
-    match subscribe(ctx, remote, &pane_ids, titles).await {
-        Ok(s) => {
-            *stream = s;
-            *subscribed_key = key;
-            Ok(())
-        }
-        Err(e) => {
-            ctx.log.log(&format!(
-                "[{}] pane subscriptions rejected ({e}) — broadcast only",
-                ctx.host.name
-            ));
-            *stream = subscribe(ctx, remote, &[], titles).await?;
-            *subscribed_key = "<broadcast>".into();
-            Ok(())
-        }
-    }
-}
-
-/// Fast-path: apply coalesced status updates without a remote snapshot, through
-/// the change-detecting reporter. Returns true if an event referenced a pane we
-/// don't mirror yet.
-async fn flush_status(ctx: &HostCtx, reports: &Reports, pending: HashMap<String, Value>) -> bool {
+    let agents = fetch_agents(&deps.remote).await?;
     let mut state = load_state(&ctx.env_state_dir, &ctx.host.name);
-    let mut need_converge = false;
-    for (remote_id, data) in pending {
-        let Some(entry) = state.panes.get_mut(&remote_id) else {
-            need_converge = true; // unknown pane → let a full pass create it
-            continue;
-        };
-        if entry.is_tombstoned() {
-            continue; // user closed this mirror — its statuses are moot
+    let sent = push_statuses(&ctx.local, &deps.reports, &ctx.host.name, &ctx.log, &agents, &mut state).await;
+    // titles ride along for agent panes (the poll already has them); a remote
+    // without `pane.updated` gets its agent titles every poll this way
+    for a in &agents {
+        if let Some(entry) = state.panes.get(&a.pane_id) {
+            relay_pane_title(&ctx.env_state_dir, &ctx.host.name, &a.pane_id, entry, a.terminal_title.as_deref());
         }
-        let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
-        let agent = info.has_agent().then_some(&info);
-        push_pane_status(&ctx.local, reports, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
     }
-    if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
-        ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
+    if sent {
+        if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
+            ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
+        }
     }
-    need_converge
+    Ok(())
 }
 
 /// Title fast-path: relay coalesced `pane.updated` titles without a snapshot.
@@ -381,21 +354,17 @@ async fn run_connected(
     };
     // whether this remote publishes pane.updated; settled by the first subscribe
     let mut title_events = true;
-    // broadcast-only first: subscribing a since-dead pane id is rejected, so
-    // converge must prune the map before the per-pane upgrade
-    let mut stream = subscribe(ctx, &remote, &[], &mut title_events).await?;
-    let mut subscribed_key = String::from("<broadcast>");
-    let state = converge(&deps).await?;
-    resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state, &mut title_events).await?;
+    let mut stream = subscribe(ctx, &remote, &mut title_events).await?;
+    converge(&deps).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
     let mut converge_at: Option<Instant> = None;
-    let mut status_at: Option<Instant> = None;
+    let mut status_at: Option<Instant> = Some(Instant::now() + STATUS_POLL);
     let mut closes_at: Option<Instant> = None;
     let mut titles_at: Option<Instant> = None;
-    let mut pending_status: HashMap<String, Value> = HashMap::new();
     let mut pending_closes: Vec<String> = Vec::new();
     let mut pending_titles: HashMap<String, Option<String>> = HashMap::new();
+    let mut status_failing = false;
 
     loop {
         let sleep = sleep_until_earliest([converge_at, status_at, closes_at, titles_at]);
@@ -404,14 +373,8 @@ async fn run_connected(
                 let now = Instant::now();
                 match ev {
                     None => return Err(err("event stream closed")),
-                    // status changes take the fast-path; structure changes
-                    // need a full reconcile (debounced 500ms)
-                    Some(e) if e.event == "pane_agent_status_changed" => {
-                        if let Some(pid) = e.data.get("pane_id").and_then(|v| v.as_str()) {
-                            // coalesce: keep only the latest per pane
-                            pending_status.insert(pid.to_string(), e.data.clone());
-                            status_at.get_or_insert(now + Duration::from_millis(150));
-                        }
+                    Some(e) if e.event == "pane_agent_detected" => {
+                        schedule(&mut status_at, now + STATUS_NUDGE);
                     }
                     // explicit remote closes are authoritative: remove the mirror
                     // directly instead of inferring it from snapshot absence
@@ -453,19 +416,11 @@ async fn run_connected(
             }
             _ = sleep => {
                 let now = Instant::now();
-                if status_at.is_some_and(|t| t <= now) {
-                    status_at = None;
-                    let pending = std::mem::take(&mut pending_status);
-                    if flush_status(ctx, &deps.reports, pending).await {
-                        // unknown pane → let a full pass create it
-                        converge_at = Some(now);
-                    }
-                }
                 if closes_at.is_some_and(|t| t <= now) {
                     closes_at = None;
                     let closed = std::mem::take(&mut pending_closes);
                     apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
-                    // reconcile + refresh subscriptions after the removals
+                    // reconcile after the removals
                     converge_at = Some(now);
                 }
                 if titles_at.is_some_and(|t| t <= now) {
@@ -484,9 +439,21 @@ async fn run_connected(
                         &ctx.closes,
                     )
                     .await;
-                    let state = converge(&deps).await?;
-                    // pane set may have changed
-                    resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state, &mut title_events).await?;
+                    converge(&deps).await?;
+                }
+                if status_at.is_some_and(|t| t <= now) {
+                    match poll_status(ctx, &deps).await {
+                        Ok(()) => status_failing = false,
+                        // the event stream is what decides the connection is
+                        // gone; one slow answer is not worth a reconnect
+                        Err(e) => {
+                            if !status_failing {
+                                ctx.log.log(&format!("[{}] status poll failed: {e}", ctx.host.name));
+                            }
+                            status_failing = true;
+                        }
+                    }
+                    status_at = Some(Instant::now() + STATUS_POLL);
                 }
             }
         }
@@ -1160,41 +1127,24 @@ mod tests {
 
     /// Detection is a separate lifecycle event from later status changes. If
     /// this broadcast subscription disappears, a newly detected agent can sit
-    /// stale until the periodic poll even though its pane is already mirrored.
+    /// stale until the next status poll even though its pane is mirrored.
+    ///
+    /// And no subscription may name a pane: herdr 0.9.0 serves every
+    /// `pane.agent_status_changed{pane_id}` by polling `pane.get` into its app
+    /// thread ten times a second, which is the load this daemon must not put on
+    /// the machines it mirrors. Status comes from the `agent.list` poll.
     #[test]
-    fn subscriptions_include_explicit_agent_detection() {
+    fn subscriptions_are_broadcast_only() {
         for titles in [true, false] {
-            let subs = sub_list(&["w1:p1".to_string()], titles);
-
+            let subs = sub_list(titles);
             assert!(subs.contains(&json!({ "type": "pane.agent_detected" })));
-            assert!(subs.contains(&json!({
-                "type": "pane.agent_status_changed",
-                "pane_id": "w1:p1",
-            })));
+            for s in &subs {
+                assert!(s.get("pane_id").is_none(), "per-pane subscription: {s}");
+                assert_ne!(s["type"], "pane.agent_status_changed");
+                assert_ne!(s["type"], "pane.output_matched");
+                assert_ne!(s["type"], "pane.scroll_changed");
+            }
         }
-    }
-
-    /// A remote that doesn't know `pane.updated` rejects the whole subscribe,
-    /// so the fallback list must really leave it out, and only that rejection
-    /// may turn it off: a current server rejecting something else lists
-    /// `pane.updated` among the variants it expected, and misreading that would
-    /// silently stop live titles on a remote that supports them.
-    #[test]
-    fn title_events_are_dropped_only_for_a_remote_that_lacks_them() {
-        let title_sub = json!({ "type": "pane.updated" });
-        assert!(sub_list(&[], true).contains(&title_sub));
-        assert!(!sub_list(&[], false).contains(&title_sub));
-
-        assert!(rejects_title_events(
-            "events.subscribe: invalid request: unknown variant `pane.updated`, expected one of \
-             `workspace.created`, `pane.created`, `pane.agent_status_changed` at line 1 column 91"
-        ));
-        // captured from herdr 0.9.0, rejecting a different variant
-        assert!(!rejects_title_events(
-            "events.subscribe: invalid request: unknown variant `pane.title_changed`, expected one of \
-             `pane.created`, `pane.closed`, `pane.updated`, `pane.focused`, `layout.updated` at line 1 column 91"
-        ));
-        assert!(!rejects_title_events("events.subscribe: pane w1:p9 not found"));
     }
 
     /// A sooner request wins; a later one never postpones a scheduled one.
@@ -1240,6 +1190,29 @@ mod tests {
         assert_eq!(owning_hosts(&env.state_dir, &hosts, "w9:t3"), vec![1]);
         assert!(owning_hosts(&env.state_dir, &hosts, "w2:t1").is_empty());
         let _ = fs::remove_dir_all(&env.state_dir);
+    }
+
+    /// A remote that doesn't know `pane.updated` rejects the whole subscribe,
+    /// so the fallback list must really leave it out, and only that rejection
+    /// may turn it off: a current server rejecting something else lists
+    /// `pane.updated` among the variants it expected, and misreading that would
+    /// silently stop live titles on a remote that supports them.
+    #[test]
+    fn title_events_are_dropped_only_for_a_remote_that_lacks_them() {
+        let title_sub = json!({ "type": "pane.updated" });
+        assert!(sub_list(true).contains(&title_sub));
+        assert!(!sub_list(false).contains(&title_sub));
+
+        assert!(rejects_title_events(
+            "events.subscribe: invalid request: unknown variant `pane.updated`, expected one of \
+             `workspace.created`, `pane.created`, `pane.agent_status_changed` at line 1 column 91"
+        ));
+        // captured from herdr 0.9.0, rejecting a different variant
+        assert!(!rejects_title_events(
+            "events.subscribe: invalid request: unknown variant `pane.title_changed`, expected one of \
+             `pane.created`, `pane.closed`, `pane.updated`, `pane.focused`, `layout.updated` at line 1 column 91"
+        ));
+        assert!(!rejects_title_events("events.subscribe: pane w1:p9 not found"));
     }
 
     fn lock_test_env(tag: &str) -> Env {

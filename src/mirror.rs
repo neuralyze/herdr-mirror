@@ -25,7 +25,7 @@ use crate::util::{Logger, Result};
 
 /// What the hub was last told, per object, as a hash of the payload sent.
 ///
-/// Every converge and every status update recomputes each mirror's report from the
+/// Every converge and every status poll recomputes each mirror's report from the
 /// remote; without this they were all re-sent unconditionally, and each one is
 /// a request into the hub herdr's single app thread plus, for shell clients, a
 /// changed shell projection queued on their (unbounded) control lane. Only a
@@ -156,8 +156,7 @@ pub struct PaneInfo {
     pub terminal_title: Option<String>,
 }
 
-/// Agent fields as they appear both in snapshot `agents[]` and in
-/// `pane.agent_status_changed` event data (null fields omitted there).
+/// Agent fields as they appear in snapshot `agents[]` and in `agent.list`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AgentInfo {
     #[serde(default)]
@@ -190,12 +189,6 @@ pub struct AgentInfo {
 }
 
 impl AgentInfo {
-    /// Does this describe a live agent (vs. a sparse release event)?
-    pub fn has_agent(&self) -> bool {
-        self.agent.as_deref().is_some_and(|a| !a.is_empty())
-            || self.agent_status.as_deref().is_some_and(|s| s != "unknown")
-    }
-
     /// The single `title` slot `pane.report_metadata` accepts. A remote agent
     /// with a user-given `name` keeps showing it (unchanged behavior — don't
     /// bury a name the user picked under an ever-changing task title). Only
@@ -288,6 +281,18 @@ pub async fn fetch_snapshot(api: &ApiClient) -> Result<Snapshot> {
     }
     let res: Res = api.request_t("session.snapshot", json!({})).await?;
     Ok(res.snapshot)
+}
+
+/// The remote's agents alone: the `agents` half of a snapshot, without the
+/// workspaces/tabs/panes/layouts the status poll has no use for.
+pub async fn fetch_agents(api: &ApiClient) -> Result<Vec<AgentInfo>> {
+    #[derive(Deserialize)]
+    struct Res {
+        #[serde(default)]
+        agents: Vec<AgentInfo>,
+    }
+    let res: Res = api.request_t("agent.list", json!({})).await?;
+    Ok(res.agents)
 }
 
 // --- layout tree ---
@@ -1583,7 +1588,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
 /// Push one pane's authoritative status (or retract it when the remote agent
 /// is gone). Mutates only its own entry (seq/reported). Reused by both the
-/// full converge and the daemon's status fast-path.
+/// full converge and the daemon's status poll.
 ///
 /// Sends nothing when the payload is the one last sent for this mirror (see
 /// `ReportCache`). Returns whether anything was sent, i.e. whether the entry's
@@ -1740,8 +1745,8 @@ pub async fn apply_remote_closes(
 }
 
 /// Push every mirrored pane's status from one list of remote agents (a
-/// snapshot's `agents`): a pane absent from the list has no agent. Returns
-/// whether anything was sent (the state needs saving).
+/// snapshot's `agents`, or `agent.list`): a pane absent from the list has no
+/// agent. Returns whether anything was sent (the state needs saving).
 pub async fn push_statuses(
     local: &ApiClient,
     reports: &Reports,
@@ -2285,16 +2290,20 @@ mod tests {
         );
     }
 
-    /// The `pane_agent_status_changed` event (herdr app/api.rs) must deserialize
-    /// into AgentInfo cleanly, or flush_status would fall back to a default (no
-    /// agent) and wrongly retract the mirror's agent. Note the event carries the
-    /// title as `title`, which lands in its own field and still reaches the
-    /// reported title slot through `effective_title`.
+    /// An `agent.list` row (herdr 0.9.0 `AgentInfo`) must deserialize into
+    /// AgentInfo cleanly, or the status poll would read the pane as agentless
+    /// and wrongly retract the mirror's agent. The pane's reported title lands
+    /// in its own field and reaches the reported title slot through
+    /// `effective_title`.
     #[test]
-    fn agent_status_event_parses_and_keeps_title() {
+    fn agent_list_row_parses_and_keeps_title() {
         let data = json!({
+            "terminal_id": "t7",
             "pane_id": "w1:p1",
             "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "focused": false,
+            "revision": 3,
             "agent_status": "working",
             "agent": "claude",
             "title": "fix the bug",
@@ -2308,7 +2317,7 @@ mod tests {
         assert_eq!(info.display_agent.as_deref(), Some("Claude"));
         assert_eq!(info.title.as_deref(), Some("fix the bug"));
         assert_eq!(info.effective_title(), Some("fix the bug"));
-        assert!(info.has_agent());
+        assert_eq!(info.state_labels.as_ref().and_then(|l| l.get("branch")).map(String::as_str), Some("main"));
     }
 
     /// A named agent that also carries a pane title must parse: with `title`
@@ -2437,23 +2446,6 @@ mod tests {
         assert_eq!(ws_rank("work: slice", &prefixes), 1);
         assert_eq!(ws_rank("vps: ~", &prefixes), 2);
         assert_eq!(ws_rank("utopia", &prefixes), 0); // local
-    }
-
-    /// An agent-exit event carries no agent + "unknown" status → has_agent()
-    /// false, so push_pane_status retracts (the intended release path).
-    #[test]
-    fn agent_exit_event_reads_as_no_agent() {
-        let data = json!({
-            "pane_id": "w1:p1",
-            "workspace_id": "w1",
-            "agent_status": "unknown",
-            "agent": null,
-            "display_agent": null,
-            "custom_status": null,
-            "state_labels": null
-        });
-        let info: AgentInfo = serde_json::from_value(data).unwrap();
-        assert!(!info.has_agent());
     }
 
     /// A hub stand-in: answers every request with an empty result and records
