@@ -970,6 +970,12 @@ const GONE_BACKOFF_MS: u64 = 60_000;
 /// echo after a quiet spell — paints at once.
 const PAINT_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Frames arriving this soon after a forwarded keystroke are taken to be its
+/// echo and paint without waiting for `PAINT_INTERVAL` (still latest-wins, and
+/// still never while the writer is busy). Sustained output outside it stays
+/// capped.
+const ECHO_WINDOW: Duration = Duration::from_millis(150);
+
 /// Input lines waiting for the ssh child. Bounded: past this the remote has
 /// not read input for a long while, and replaying a backlog late is worse than
 /// saying it was dropped.
@@ -1049,6 +1055,9 @@ struct App {
     /// the owed paint is held to this time by the frame-rate cap
     paint_at: Option<Instant>,
     last_paint: Option<Instant>,
+    /// until then, frames are a keystroke's echo: they paint at once instead
+    /// of waiting out `PAINT_INTERVAL` (see `send_input`)
+    echo_until: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
     /// remote pane foreground classification, None=unknown (fail safe to local).
@@ -1117,6 +1126,7 @@ impl App {
             paint_pending: false,
             paint_at: None,
             last_paint: None,
+            echo_until: None,
             predict: Predictor::new(),
             remote_fg: None,
             select: Select::new(),
@@ -1154,7 +1164,8 @@ impl App {
             return;
         }
         let now = Instant::now();
-        if let Some(next) = self.last_paint.map(|t| t + PAINT_INTERVAL).filter(|&t| t > now) {
+        let echoing = self.echo_until.is_some_and(|t| t > now);
+        if let Some(next) = self.last_paint.map(|t| t + PAINT_INTERVAL).filter(|&t| t > now && !echoing) {
             self.paint_at.get_or_insert(next);
             return;
         }
@@ -1394,8 +1405,16 @@ impl App {
         self.send_line(msg.to_string() + "\n")
     }
 
+    /// Forward keystrokes. The frames that come back within `ECHO_WINDOW` are
+    /// their echo, and paint without waiting for the frame-rate cap: the cap is
+    /// for sustained output, and holding an echo for up to `PAINT_INTERVAL`
+    /// is latency the user feels on every key.
     fn send_input(&mut self, bytes: &[u8]) -> bool {
-        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }))
+        let sent = self.send(json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }));
+        if sent {
+            self.echo_until = Some(Instant::now() + ECHO_WINDOW);
+        }
+        sent
     }
 
     /// Ask the remote script for control, on the connection that is already
@@ -3140,6 +3159,48 @@ mod tests {
     }
 
     // --- output: never blocking, latest wins ---
+
+    async fn writer_idle(app: &App) {
+        for _ in 0..200 {
+            if !app.out.busy() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("writer never drained");
+    }
+
+    /// Sustained output is capped: a frame right behind a paint waits for the
+    /// interval. A keystroke's echo is not: a frame right behind a paint, but
+    /// right after forwarded input, paints at once. Once the echo window has
+    /// passed, the cap applies again.
+    #[tokio::test]
+    async fn an_echo_frame_is_not_held_by_the_frame_rate_cap() {
+        let (mut app, mut input) = watch_only_app(true, Output::new(std::io::sink()));
+        app.session.as_mut().unwrap().phase = Phase::Control { acked: true };
+
+        app.handle_frame(1, screen("$ "));
+        assert!(!app.paint_pending, "a frame after a quiet spell paints at once");
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ output"));
+        assert!(app.paint_pending && app.paint_at.is_some(), "sustained output waits for the cap");
+
+        app.paint_at = None;
+        app.paint_pending = false;
+        app.last_paint = Some(Instant::now());
+        app.handle_stdin(b"x".to_vec()).await;
+        assert_eq!(sent(&mut input), [input_line(b"x")]);
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ x"));
+        assert!(!app.paint_pending, "the echo was held by the cap");
+        assert!(app.paint_at.is_none());
+
+        tokio::time::sleep(ECHO_WINDOW + Duration::from_millis(20)).await;
+        app.handle_frame(1, screen("$ x"));
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ x more"));
+        assert!(app.paint_pending && app.paint_at.is_some(), "the cap is back after the echo window");
+    }
 
     /// The hub stops draining the pane while a remote scrolls 2000 frames. The
     /// event loop never waits on the pane, paints at most one screen while the
