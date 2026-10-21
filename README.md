@@ -320,7 +320,7 @@ mirrored pane whose remote pi or omp reports a session file, the daemon keeps a
 local tail copy:
 
 - `~/.local/state/herdr-mirror/journals/sessions/<id>.jsonl` holds the journal's
-  first row (the `{"type":"session",...}` header) plus its last
+  header (its rows through the `{"type":"session",...}` row) plus its last
   `journal_tail_mb` (default 16) MB, starting on a row boundary. Appends are
   followed by byte offset over the host's existing ssh connection: on the next
   2 s status poll while the agent works or after any change of its state, every

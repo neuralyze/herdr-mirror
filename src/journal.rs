@@ -48,8 +48,9 @@ pub const TOKEN: &str = "mirror_session_path";
 /// that does not exist).
 const TOKEN_VALUE_MAX: usize = 80;
 pub const DEFAULT_TAIL_MB: u64 = 16;
-/// The header row is the journal's first line; a first line longer than this
-/// is not a header and the copy goes without one.
+/// The header is the journal's leading rows up to and including its
+/// `{"type":"session",...}` row (omp 18 writes an in-place `title` row first),
+/// else its first row; a header longer than this is dropped.
 const HEADER_MAX: u64 = 64 * 1024;
 /// A pane whose agent is not working and whose status did not change is
 /// looked at this often; a working one every status poll.
@@ -288,16 +289,21 @@ fn parse_stats(out: &[u8], n: usize) -> Vec<Option<(u64, u64)>> {
         .collect()
 }
 
-/// Seed read: `<h> <rs>\n`, then the `h`-byte header row (0 when the first
-/// line is not a row within HEADER_MAX), then the file from `rs` to `size`.
+/// Seed read: `<h> <rs>\n`, then the `h`-byte header (the rows through the
+/// first session row, else the first row; 0 when neither fits in HEADER_MAX),
+/// then the file from `rs` to `size`.
 /// `rs` is one byte before where the tail starts, so a tail that happens to
 /// start on a row boundary is recognised as one (`floor` = `size - tail`).
 fn seed_command(path: &str, floor: u64, size: u64) -> String {
     let script = format!(
         r#"f=$1; fl=$2; sz=$3
+h=$(head -c {HEADER_MAX} -- "$f" | LC_ALL=C awk "{{n+=length(\$0)+1}} /^\{{\"type\":\"session\"/{{print n; s=1; exit}} END{{if(!s) print 0}}")
+[ "$h" -le {HEADER_MAX} ] || h=0
+if [ "$h" -eq 0 ]; then
 h=$(head -c {HEADER_MAX} -- "$f" | head -n 1 | wc -c)
 n=$(head -c {HEADER_MAX} -- "$f" | head -n 1 | wc -l)
 [ "$n" -eq 1 ] || h=0
+fi
 st=$fl; [ "$h" -gt "$st" ] && st=$h
 rs=$st; [ "$st" -gt "$h" ] && rs=$((st - 1))
 printf "%s %s\n" "$h" "$rs"
@@ -1113,6 +1119,23 @@ mod tests {
         assert_ne!(first, second);
         assert!(!Path::new(&first).exists());
         assert_eq!(fs::read(&second).unwrap(), fs::read(&other).unwrap());
+        let _ = fs::remove_dir_all(&lab.state);
+    }
+
+    /// omp 18 opens a journal with an in-place `title` row, then the session
+    /// row: the header keeps both, so a cut copy still names its session.
+    #[tokio::test]
+    async fn header_runs_through_the_session_row() {
+        let lab = Lab::new("title");
+        let head = format!("{{\"type\":\"title\",\"pad\":\"{}\"}}\n{{\"type\":\"session\",\"id\":\"u\"}}\n", " ".repeat(200));
+        fs::write(&lab.remote, head.as_bytes()).unwrap();
+        lab.push(0, 40);
+        let mut j = lab.open((row(0).len() * 5) as u64);
+        j.tick(&[lab.want("idle")]).await;
+        let copy = String::from_utf8(lab.copy().unwrap()).unwrap();
+        assert!(copy.starts_with(&head), "both header rows kept");
+        assert!(copy.ends_with(&row(39)));
+        assert!(!copy.contains("r0030"));
         let _ = fs::remove_dir_all(&lab.state);
     }
 
