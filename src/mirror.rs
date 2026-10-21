@@ -180,6 +180,10 @@ pub struct AgentInfo {
     pub terminal_title: Option<String>,
     #[serde(default)]
     pub agent_status: Option<String>,
+    /// bumped by the remote on every agent state change: a whole turn can
+    /// start and end between two polls, leaving `agent_status` unchanged
+    #[serde(default)]
+    pub state_change_seq: Option<u64>,
     pub custom_status: Option<String>,
     pub state_labels: Option<BTreeMap<String, String>>,
     /// custom metadata tokens the remote publishes ($model, $summary, …).

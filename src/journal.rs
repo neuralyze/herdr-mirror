@@ -82,6 +82,9 @@ pub struct Want {
     pub remote_pane: String,
     pub remote_path: String,
     pub status: Option<String>,
+    /// the remote's `state_change_seq`: moves on every state change, even a
+    /// turn that began and ended between two polls
+    pub state_seq: Option<u64>,
 }
 
 /// The panes worth a copy: mirrored (mapped, not tombstoned) and reporting a
@@ -96,6 +99,7 @@ pub fn wants(agents: &[AgentInfo], state: &HostState) -> Vec<Want> {
                 remote_pane: a.pane_id.clone(),
                 remote_path: s.value.clone(),
                 status: a.agent_status.clone(),
+                state_seq: a.state_change_seq,
             })
         })
         .collect()
@@ -452,6 +456,7 @@ pub fn gc_blobs(state_dir: &Path, log: &Logger) {
 struct Copy {
     meta: Option<Meta>,
     last_status: Option<String>,
+    last_seq: Option<u64>,
     last_check: Option<Instant>,
     absent_since: Option<Instant>,
 }
@@ -602,6 +607,7 @@ impl Journals {
             let is_due = c.meta.is_none()
                 || w.status.as_deref() == Some("working")
                 || c.last_status != w.status
+                || c.last_seq != w.state_seq
                 || c.last_check.is_none_or(|t| now.duration_since(t) >= IDLE_RECHECK);
             if is_due {
                 due.push(w);
@@ -625,6 +631,7 @@ impl Journals {
                 if let Some(c) = self.copies.get_mut(&w.remote_pane) {
                     c.last_check = Some(now);
                     c.last_status = w.status.clone();
+                    c.last_seq = w.state_seq;
                 }
             }
         }
@@ -977,6 +984,7 @@ mod tests {
                 remote_pane: "w1:p1".into(),
                 remote_path: self.remote.display().to_string(),
                 status: Some(status.into()),
+                state_seq: None,
             }
         }
         fn open(&self, tail: u64) -> Journals {
