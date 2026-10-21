@@ -70,8 +70,15 @@ impl RemoteStatus {
 
 struct SshOutput {
     code: i32,
-    out: String,
+    /// raw stdout: journal reads carry bytes that must not be re-encoded
+    out: Vec<u8>,
     err: String,
+}
+
+impl SshOutput {
+    fn out_text(&self) -> String {
+        String::from_utf8_lossy(&self.out).into_owned()
+    }
 }
 
 async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
@@ -87,7 +94,7 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
         Err(e) => {
             return SshOutput {
                 code: 1,
-                out: String::new(),
+                out: Vec::new(),
                 err: e.to_string(),
             }
         }
@@ -111,12 +118,12 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
     match timeout(Duration::from_millis(timeout_ms), collect).await {
         Ok(Ok(status)) => SshOutput {
             code: status.code().unwrap_or(1),
-            out: String::from_utf8_lossy(&out).into_owned(),
+            out,
             err: String::from_utf8_lossy(&err_output).into_owned(),
         },
         Ok(Err(e)) => SshOutput {
             code: 1,
-            out: String::new(),
+            out: Vec::new(),
             err: e.to_string(),
         },
         Err(_) => {
@@ -129,7 +136,7 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
             let _ = child.wait().await;
             SshOutput {
                 code: 1,
-                out: String::new(),
+                out: Vec::new(),
                 err: "ssh timeout".into(),
             }
         }
@@ -159,6 +166,56 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
             path.display()
         ))
     })
+}
+
+/// Byte-exact remote command runner, detached from the `RemoteHost` that owns
+/// the connection so a side task (journal tails) can share the transport.
+#[derive(Clone)]
+pub struct RemoteExec {
+    via: ExecVia,
+}
+
+#[derive(Clone)]
+enum ExecVia {
+    /// `-S <ctl> -o BatchMode=yes` + target: rides the host's ControlMaster
+    Ssh { base: Vec<String>, target: String },
+    Docker(crate::docker::Container),
+    /// the command run by a local `sh -c`, which is how the remote login
+    /// shell sees it: lets tests drive the real remote scripts
+    #[cfg(test)]
+    Local,
+}
+
+impl RemoteExec {
+    #[cfg(test)]
+    pub fn local() -> RemoteExec {
+        RemoteExec { via: ExecVia::Local }
+    }
+
+    /// Run `command` (already quoted for the remote login shell) and return
+    /// its stdout untouched. `what` names the operation in errors instead of
+    /// echoing a long script.
+    pub async fn run(&self, what: &str, command: &str, timeout_ms: u64) -> Result<Vec<u8>> {
+        let (base, target) = match &self.via {
+            ExecVia::Ssh { base, target } => (base, target),
+            ExecVia::Docker(c) => return c.exec_bytes(what, command, timeout_ms).await,
+            #[cfg(test)]
+            ExecVia::Local => {
+                let out = Command::new("sh").args(["-c", command]).stdin(Stdio::null()).output().await?;
+                if !out.status.success() {
+                    return Err(err(format!("{what} failed: {}", out.status)));
+                }
+                return Ok(out.stdout);
+            }
+        };
+        let mut args = base.clone();
+        args.extend([target.clone(), command.to_string()]);
+        let res = ssh(&args, timeout_ms).await;
+        if res.code != 0 {
+            return Err(err(format!("ssh {what} failed: {}", nonempty(&res.err, res.code))));
+        }
+        Ok(res.out)
+    }
 }
 
 pub struct RemoteHost {
@@ -400,7 +457,18 @@ impl RemoteHost {
                 nonempty(&res.err, res.code)
             )));
         }
-        Ok(res.out)
+        Ok(res.out_text())
+    }
+
+    /// A cheap, cloneable handle for byte-exact remote commands over this
+    /// connection's transport (the ControlMaster, or the resolved container).
+    /// Taken after `connect_api`, so a docker host's container is known.
+    pub fn executor(&self) -> RemoteExec {
+        let via = match &self.container {
+            Some(c) => ExecVia::Docker(c.clone()),
+            None => ExecVia::Ssh { base: self.base_args(), target: self.cfg.target.clone() },
+        };
+        RemoteExec { via }
     }
 
     pub async fn status(&self) -> Result<RemoteStatus> {
@@ -696,6 +764,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             compression: true,
+            journal_tail_bytes: 0,
             api_transport: ApiTransport::Auto,
             always_control: true,
         }

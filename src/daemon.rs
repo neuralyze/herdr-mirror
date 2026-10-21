@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
@@ -163,6 +163,19 @@ struct HostCtx {
     log: Logger,
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
+    /// this host's published journal copies; outlives every connection so a
+    /// reconnect's first status push already carries them
+    journals: crate::journal::Published,
+}
+
+/// Aborts the task when dropped: the journal task lives exactly as long as
+/// the connection whose ControlMaster it shares.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Remote events, all broadcast (no `pane_id`). Every one of these is served
@@ -258,14 +271,33 @@ fn schedule(current: &mut Option<Instant>, at: Instant) {
 
 /// Status poll: one `agent.list`, pushed through the change-detecting reporter
 /// so only mirrors whose remote agent actually changed cost the hub anything.
-async fn poll_status(ctx: &HostCtx, deps: &ConvergeDeps) -> Result<()> {
+/// The same list tells the journal task which panes to keep copies for.
+async fn poll_status(
+    ctx: &HostCtx,
+    deps: &ConvergeDeps,
+    journal: Option<&watch::Sender<Vec<crate::journal::Want>>>,
+) -> Result<()> {
     // a hidden host's mirrors are gone locally; keep it quiet
     if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
         return Ok(());
     }
     let agents = fetch_agents(&deps.remote).await?;
     let mut state = load_state(&ctx.env_state_dir, &ctx.host.name);
-    let sent = push_statuses(&ctx.local, &deps.reports, &ctx.host.name, &ctx.log, &agents, &mut state).await;
+    if let Some(tx) = journal {
+        // every poll, changed or not: a working agent's journal is followed
+        // on this beat
+        let _ = tx.send(crate::journal::wants(&agents, &state));
+    }
+    let sent = push_statuses(
+        &ctx.local,
+        &deps.reports,
+        &ctx.host.name,
+        &ctx.log,
+        &agents,
+        deps.journals.as_ref(),
+        &mut state,
+    )
+    .await;
     // titles ride along for agent panes (the poll already has them); a remote
     // without `pane.updated` gets its agent titles every poll this way
     for a in &agents {
@@ -367,7 +399,23 @@ async fn run_connected(
         // fresh per connection: `mark_unknown` overwrote everything on the way
         // down, so the first pass after a reconnect must send it all again
         reports: new_reports(),
+        journals: Some(ctx.journals.clone()),
     };
+    // Journal tails share this connection's transport and die with it. Opening
+    // them publishes the copies already on disk before the first converge
+    // reports statuses.
+    let journal = (ctx.host.journal_tail_bytes > 0).then(|| {
+        let (tx, rx) = watch::channel(Vec::new());
+        let journals = crate::journal::Journals::open(
+            &ctx.host.name,
+            &ctx.env_state_dir,
+            ctx.host.journal_tail_bytes,
+            remote_host.executor(),
+            ctx.journals.clone(),
+            ctx.log.clone(),
+        );
+        (tx, AbortOnDrop(tokio::spawn(crate::journal::run(journals, rx))))
+    });
     // whether this remote publishes pane.updated; settled by the first subscribe
     let mut title_events = true;
     let mut stream = subscribe(ctx, &remote, &mut title_events).await?;
@@ -459,7 +507,7 @@ async fn run_connected(
                     converge(&deps).await?;
                 }
                 if status_at.is_some_and(|t| t <= now) {
-                    match poll_status(ctx, &deps).await {
+                    match poll_status(ctx, &deps, journal.as_ref().map(|(tx, _)| tx)).await {
                         Ok(()) => status_failing = false,
                         // the event stream is what decides the connection is
                         // gone; one slow answer is not worth a reconnect
@@ -981,6 +1029,20 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             .await;
     }
     let closes = crate::closes::new_closes();
+    // copies left by a host that is gone from the config (or has journal
+    // tails off) have nobody to follow or delete them
+    let journal_hosts: std::collections::HashSet<String> =
+        config.hosts.iter().filter(|h| h.journal_tail_bytes > 0).map(|h| h.name.clone()).collect();
+    crate::journal::prune_foreign(&env.state_dir, &journal_hosts, &log);
+    if !journal_hosts.is_empty() {
+        let (state_dir, log) = (env.state_dir.clone(), log.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::journal::BLOB_GC_EVERY).await;
+                crate::journal::gc_blobs(&state_dir, &log);
+            }
+        });
+    }
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
@@ -993,6 +1055,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
+            journals: crate::journal::new_published(),
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -1223,6 +1286,8 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             closes: crate::closes::new_closes(),
             // one pass: nothing was sent before it, so everything is sent
             reports: new_reports(),
+            // the daemon owns the journal copies; leave their tokens alone
+            journals: None,
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));

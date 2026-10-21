@@ -311,6 +311,39 @@ an image off the clipboard needs `wl-paste` or `xclip` on Linux (macOS and
 dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 ~/.cache/herdr-mirror/pastes` is always safe.
 
+### Agent journals
+
+A transcript viewer on this machine (for example Collie's History) reads an
+agent's session journal from disk, but a mirrored agent's journal lives on the
+remote, often runs to hundreds of MB, and is named by a remote path. So for every
+mirrored pane whose remote pi or omp reports a session file, the daemon keeps a
+local tail copy:
+
+- `~/.local/state/herdr-mirror/journals/sessions/<id>.jsonl` holds the journal's
+  first row (the `{"type":"session",...}` header) plus its last
+  `journal_tail_mb` (default 16) MB, starting on a row boundary. Appends are
+  followed by byte offset over the host's existing ssh connection: every 2 s
+  while the agent works, every 30 s otherwise, and only the new bytes travel.
+  Past twice the tail the copy is rewritten (atomically) to header + tail. A
+  replaced or truncated journal, a new session (`/new`), or a gap longer than
+  the tail re-seeds it.
+- Images the copy references (`blob:sha256:<hash>`) are fetched into
+  `journals/blobs/<hash>`, the sibling `blobs/` pi/omp readers look in: at most
+  8 MB each, 8 per pass, and swept every 10 minutes once no copy references
+  them.
+- The copy's path is published on the mirror pane as the herdr metadata token
+  `mirror_session_path` (the default sidebar shows no custom tokens). It is not
+  a herdr agent session: herdr accepts a pi/omp session only for a pane running
+  that agent, and a persisted one would make a cold restore type
+  `omp --resume` into the mirror pane. Tokens are neither persisted nor read on
+  restore.
+- Copies are deleted 30 s after their pane stops reporting a session or stops
+  being mirrored, and at daemon start for hosts no longer configured. Files are
+  `0600`, directories `0700`.
+
+To serve them, point the viewer's pi/omp sessions root at
+`~/.local/state/herdr-mirror/journals/sessions` and have it read the token.
+
 ### Mouse
 
 - **Drag to select, release to copy** — The text reaches your own clipboard, even over ssh.
@@ -344,6 +377,9 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
                          # the daemon's connection. Set on the command line, so
                          # it beats `Compression no` in ~/.ssh/config; set
                          # false here (globally or per host) to turn it off.
+# journal_tail_mb = 16   # default. Hub-local tail of each mirrored pi/omp
+                         # session journal (see "Agent journals"); 0 turns it
+                         # off. Also settable per host.
 
 [hosts.work]
 target = "work"
@@ -362,6 +398,7 @@ target = "work"
                                      # over ssh exec (needs socat or python3).
                                      # auto = socket, falling back to exec.
 # compression = false                # per-host override of the global default
+# journal_tail_mb = 0                # per-host override, e.g. no journal tails
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"

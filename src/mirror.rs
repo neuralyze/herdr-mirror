@@ -186,6 +186,19 @@ pub struct AgentInfo {
     /// `default` on purpose: a pre-0.7.4 remote never sends this.
     #[serde(default)]
     pub tokens: HashMap<String, String>,
+    /// the session the remote agent reported (herdr 0.9.0+). A pi/omp `path`
+    /// is the journal a hub-local tail copy follows (see journal.rs).
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AgentSession {
+    /// "path" or "id"
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub value: String,
 }
 
 impl AgentInfo {
@@ -578,6 +591,9 @@ pub struct ConvergeDeps {
     pub closes: crate::closes::Closes,
     /// what the hub was last told (see `ReportCache`)
     pub reports: Reports,
+    /// journal copies published for this host's panes (see journal.rs), or
+    /// `None` for a one-shot pass that must leave their tokens alone
+    pub journals: Option<crate::journal::Published>,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -1585,7 +1601,16 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     state.ratios.retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
 
     // 5. push authoritative agent status onto mirror panes
-    push_statuses(&deps.local, &deps.reports, &deps.host.name, &deps.log, &remote_snap.agents, state).await;
+    push_statuses(
+        &deps.local,
+        &deps.reports,
+        &deps.host.name,
+        &deps.log,
+        &remote_snap.agents,
+        deps.journals.as_ref(),
+        state,
+    )
+    .await;
     // 6. and each remote pane's terminal title into its mirror
     relay_titles(deps, &remote_snap, state);
     Ok(())
@@ -1598,6 +1623,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 /// Sends nothing when the payload is the one last sent for this mirror (see
 /// `ReportCache`). Returns whether anything was sent, i.e. whether the entry's
 /// seq moved and the state needs saving.
+///
+/// `journal` is this pane's hub-local journal copy for the `mirror_session_path`
+/// token: `Some(Some(path))` sets it, `Some(None)` clears it, and `None` leaves
+/// it alone (a one-shot pass that doesn't own the copies).
+#[allow(clippy::too_many_arguments)]
 pub async fn push_pane_status(
     local: &ApiClient,
     reports: &Reports,
@@ -1605,6 +1635,7 @@ pub async fn push_pane_status(
     remote_id: &str,
     entry: &mut PaneEntry,
     agent: Option<&AgentInfo>,
+    journal: Option<Option<&str>>,
     log: &Logger,
 ) -> bool {
     if entry.is_tombstoned() {
@@ -1647,7 +1678,7 @@ pub async fn push_pane_status(
                 "display_agent": display,
                 "title": agent.effective_title(),
                 "state_labels": agent.state_labels.clone().unwrap_or_default(),
-                "tokens": agent.tokens.clone(),
+                "tokens": pane_tokens(&agent.tokens, journal),
             });
             if custom.is_none() {
                 meta["clear_custom_status"] = json!(true);
@@ -1688,19 +1719,20 @@ pub async fn push_pane_status(
                 log.log(&format!("release_agent {}: {e}", entry.local_id));
             }
             entry.seq += 1;
+            let mut clear = json!({
+                "pane_id": entry.local_id,
+                "source": source,
+                "clear_display_agent": true,
+                "clear_custom_status": true,
+                "clear_state_labels": true,
+                "clear_title": true,
+                "seq": entry.seq,
+            });
+            if journal.is_some() {
+                clear["tokens"] = json!({ crate::journal::TOKEN: Value::Null });
+            }
             let _ = local
-                .request(
-                    "pane.report_metadata",
-                    json!({
-                        "pane_id": entry.local_id,
-                        "source": source,
-                        "clear_display_agent": true,
-                        "clear_custom_status": true,
-                        "clear_state_labels": true,
-                        "clear_title": true,
-                        "seq": entry.seq,
-                    }),
-                )
+                .request("pane.report_metadata", clear)
                 .await;
             entry.reported = None;
             true
@@ -1749,22 +1781,45 @@ pub async fn apply_remote_closes(
     }
 }
 
+/// The tokens a mirror pane's metadata report carries: the remote's own, minus
+/// any `mirror_session_path` (a path on the remote, or on a hub further up a
+/// chain — never a file here), plus this hub's journal copy when `journal`
+/// says what it is.
+fn pane_tokens(remote: &HashMap<String, String>, journal: Option<Option<&str>>) -> serde_json::Map<String, Value> {
+    let mut tokens: serde_json::Map<String, Value> = remote
+        .iter()
+        .filter(|(k, _)| k.as_str() != crate::journal::TOKEN)
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
+    if let Some(path) = journal {
+        tokens.insert(crate::journal::TOKEN.into(), path.map_or(Value::Null, |p| json!(p)));
+    }
+    tokens
+}
+
 /// Push every mirrored pane's status from one list of remote agents (a
 /// snapshot's `agents`, or `agent.list`): a pane absent from the list has no
-/// agent. Returns whether anything was sent (the state needs saving).
+/// agent. `journals`: the published journal copies, `None` to leave every
+/// pane's journal token alone. Returns whether anything was sent (the state
+/// needs saving).
 pub async fn push_statuses(
     local: &ApiClient,
     reports: &Reports,
     host_name: &str,
     log: &Logger,
     agents: &[AgentInfo],
+    journals: Option<&crate::journal::Published>,
     state: &mut HostState,
 ) -> bool {
     let agent_by_pane: HashMap<&str, &AgentInfo> = agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+    // copied out: the lock must not be held across the requests below
+    let journals: Option<HashMap<String, String>> =
+        journals.map(|p| p.lock().map(|m| m.clone()).unwrap_or_default());
     let mut sent = false;
     for (remote_id, entry) in state.panes.iter_mut() {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
-        sent |= push_pane_status(local, reports, host_name, remote_id, entry, agent, log).await;
+        let journal = journals.as_ref().map(|m| m.get(remote_id).map(String::as_str));
+        sent |= push_pane_status(local, reports, host_name, remote_id, entry, agent, journal, log).await;
     }
     sent
 }
@@ -2013,6 +2068,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             compression: true,
+            journal_tail_bytes: 0,
             api_transport: crate::config::ApiTransport::Auto,
         }
     }
@@ -2455,8 +2511,9 @@ mod tests {
     }
 
     /// A hub stand-in: answers every request with an empty result and records
-    /// the method names, one request per connection like herdr.
-    async fn fake_hub(tag: &str) -> (ApiClient, Arc<Mutex<Vec<String>>>, PathBuf) {
+    /// the method names (and the whole requests), one request per connection
+    /// like herdr.
+    async fn fake_hub(tag: &str) -> (ApiClient, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<Value>>>, PathBuf) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("hm-hub-{tag}-{}-{nonce}", std::process::id()));
@@ -2464,10 +2521,11 @@ mod tests {
         let sock = dir.join("api.sock");
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen2 = seen.clone();
+        let reqs: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (seen2, reqs2) = (seen.clone(), reqs.clone());
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let seen = seen2.clone();
+                let (seen, reqs) = (seen2.clone(), reqs2.clone());
                 tokio::spawn(async move {
                     let (read, mut write) = stream.into_split();
                     let mut lines = BufReader::new(read).lines();
@@ -2476,6 +2534,7 @@ mod tests {
                         let method = req["method"].as_str().unwrap_or("").to_string();
                         if method != "ping" {
                             seen.lock().unwrap().push(method);
+                            reqs.lock().unwrap().push(req.clone());
                         }
                         let reply = json!({ "id": req["id"], "result": {} }).to_string() + "\n";
                         let _ = write.write_all(reply.as_bytes()).await;
@@ -2484,7 +2543,7 @@ mod tests {
             }
         });
         let api = ApiClient::connect(&sock).await.unwrap();
-        (api, seen, dir)
+        (api, seen, reqs, dir)
     }
 
     fn agent(pane: &str, status: &str) -> AgentInfo {
@@ -2500,12 +2559,64 @@ mod tests {
         std::mem::take(&mut *seen.lock().unwrap())
     }
 
+    /// The journal copy rides the metadata report as `mirror_session_path`:
+    /// set when published, re-sent when it changes, cleared when it goes, and
+    /// untouched by a pass that doesn't own the copies. A remote's own token of
+    /// that name never passes through.
+    #[tokio::test]
+    async fn journal_copy_is_reported_as_a_token() {
+        let (local, _seen, reqs, dir) = fake_hub("journal-token").await;
+        let log = Logger::new(&dir, false);
+        let reports = new_reports();
+        let published = crate::journal::new_published();
+        let mut state = HostState::default();
+        state.panes.insert(
+            "w1:p1".into(),
+            PaneEntry { local_id: "w7:p1".into(), tombstone: None, seq: 0, reported: None },
+        );
+        let mut a = agent("w1:p1", "idle");
+        a.tokens.insert(crate::journal::TOKEN.into(), "/remote/path.jsonl".into());
+        a.tokens.insert("model".into(), "m".into());
+        let token = |reqs: &Arc<Mutex<Vec<Value>>>| -> Option<Value> {
+            let reqs = std::mem::take(&mut *reqs.lock().unwrap());
+            let meta = reqs.iter().rev().find(|r| r["method"] == "pane.report_metadata")?;
+            let tokens = &meta["params"]["tokens"];
+            assert_eq!(tokens.get("model"), Some(&json!("m")), "the remote's other tokens still pass");
+            Some(tokens.get(crate::journal::TOKEN).cloned().unwrap_or(json!("<absent>")))
+        };
+
+        push_statuses(&local, &reports, "vps", &log, &[a.clone()], Some(&published), &mut state).await;
+        assert_eq!(token(&reqs), Some(Value::Null), "no copy yet: cleared, never the remote's path");
+
+        published.lock().unwrap().insert("w1:p1".into(), "/hub/journals/sessions/abc.jsonl".into());
+        push_statuses(&local, &reports, "vps", &log, &[a.clone()], Some(&published), &mut state).await;
+        assert_eq!(token(&reqs), Some(json!("/hub/journals/sessions/abc.jsonl")));
+
+        // unchanged: nothing sent
+        push_statuses(&local, &reports, "vps", &log, &[a.clone()], Some(&published), &mut state).await;
+        assert_eq!(token(&reqs), None);
+
+        // a one-shot pass leaves the token alone
+        let other = new_reports();
+        push_statuses(&local, &other, "vps", &log, &[a.clone()], None, &mut state).await;
+        assert_eq!(token(&reqs), Some(json!("<absent>")));
+
+        // the agent leaves: the release clears it
+        published.lock().unwrap().clear();
+        push_statuses(&local, &reports, "vps", &log, &[], Some(&published), &mut state).await;
+        let sent = std::mem::take(&mut *reqs.lock().unwrap());
+        let clear = sent.iter().find(|r| r["method"] == "pane.report_metadata").expect("release clears metadata");
+        assert_eq!(clear["params"]["tokens"][crate::journal::TOKEN], Value::Null);
+        assert!(clear["params"]["tokens"].get(crate::journal::TOKEN).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// What the hub receives over a status poll's life: a report only when the
     /// remote's agent changed, a release once, a re-report after a release, and
     /// everything again once the local server may have lost it.
     #[tokio::test]
     async fn statuses_are_sent_only_when_they_change() {
-        let (local, seen, dir) = fake_hub("dedupe").await;
+        let (local, seen, _reqs, dir) = fake_hub("dedupe").await;
         let log = Logger::new(&dir, false);
         let reports = new_reports();
         let mut state = HostState::default();
@@ -2522,7 +2633,7 @@ mod tests {
             let (local, reports, log) = (local.clone(), reports.clone(), log.clone());
             let mut owned = std::mem::take(state);
             async move {
-                let sent = push_statuses(&local, &reports, "vps", &log, &agents, &mut owned).await;
+                let sent = push_statuses(&local, &reports, "vps", &log, &agents, None, &mut owned).await;
                 (sent, owned)
             }
         };
