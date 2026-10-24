@@ -966,6 +966,106 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
+/// How long herdr may take to deliver a close EVENT after the close shows in a
+/// snapshot. herdr serves event subscriptions on a 100 ms tick, so a snapshot
+/// taken right after a close (a converge already in flight when the user
+/// closes a tab) can show the object gone ~100 ms before its event arrives.
+/// Measured on herdr 0.9.5: close call 17-21 ms, snapshot without the object
+/// 17-21 ms, `tab_closed` event 100 ms. A converge that tombstoned the mirror
+/// in that window lost the user's intent for good, and the remote lingered.
+const CLOSE_EVENT_LAG: Duration = Duration::from_millis(500);
+const CLOSE_EVENT_POLL: Duration = Duration::from_millis(25);
+
+/// The mapped local ids (workspaces, tabs, panes) this pass's local snapshot no
+/// longer lists. Only these may have their recorded close intent consumed: a
+/// close event for an object the snapshot still lists (the snapshot predates
+/// the close) must wait for the pass that can see it gone, or the intent is
+/// drained by a pass that cannot act on it.
+fn absent_mapped_ids(
+    state: &HostState,
+    local_ws: &HashSet<String>,
+    local_tabs: &HashSet<&str>,
+    local_panes: &HashSet<&str>,
+) -> HashSet<String> {
+    state
+        .workspaces
+        .values()
+        .map(|e| &e.local_id)
+        .filter(|id| !local_ws.contains(id.as_str()))
+        .chain(state.tabs.values().map(|e| &e.local_id).filter(|id| !local_tabs.contains(id.as_str())))
+        .chain(state.panes.values().map(|e| &e.local_id).filter(|id| !local_panes.contains(id.as_str())))
+        .cloned()
+        .collect()
+}
+
+/// Is a live mirror gone from the hub (remote object still there, nothing
+/// claiming the close yet)? That is either a user close whose event is still in
+/// flight, or an absence nobody asked for (rebuild, restart). Only waiting
+/// tells them apart.
+fn awaiting_close_event(state: &HostState, v: &CloseView, claimed: &HashSet<String>) -> bool {
+    let ws_gone = state.workspaces.iter().any(|(rid, e)| {
+        !e.is_tombstoned()
+            && !v.local_ws.contains(&e.local_id)
+            && v.remote_ws.contains(rid.as_str())
+            && !claimed.contains(&e.local_id)
+    });
+    ws_gone
+        || state.panes.iter().any(|(rid, e)| {
+            if e.is_tombstoned()
+                || v.local_panes.contains(e.local_id.as_str())
+                || !v.remote_panes.contains(rid.as_str())
+                || claimed.contains(&e.local_id)
+            {
+                return false;
+            }
+            // a pane whose whole workspace is gone is collateral, not a pane close
+            let ws_live = v
+                .pane_ws
+                .get(rid.as_str())
+                .and_then(|ws| state.workspaces.get(*ws))
+                .is_some_and(|w| !w.is_tombstoned() && v.local_ws.contains(&w.local_id));
+            let tab_claimed = v
+                .pane_tab
+                .get(rid.as_str())
+                .and_then(|t| state.tabs.get(*t))
+                .is_some_and(|t| claimed.contains(&t.local_id));
+            ws_live && !tab_claimed
+        })
+}
+
+/// What `awaiting_close_event` needs to know of both snapshots.
+struct CloseView<'a> {
+    local_ws: &'a HashSet<String>,
+    local_panes: &'a HashSet<&'a str>,
+    remote_ws: &'a HashSet<&'a str>,
+    remote_panes: &'a HashSet<&'a str>,
+    pane_ws: &'a HashMap<&'a str, &'a str>,
+    pane_tab: &'a HashMap<&'a str, &'a str>,
+}
+
+/// Take the user closes this pass can act on. When `awaiting` says a mirror is
+/// gone without a claimed close, give the event up to `lag` to arrive (polling
+/// the tracker, returning at once when nothing is awaited any more) before the
+/// caller tombstones it.
+async fn claim_user_closes(
+    closes: &crate::closes::Closes,
+    mine: &HashSet<String>,
+    lag: Duration,
+    awaiting: impl Fn(&HashSet<String>) -> bool,
+) -> HashSet<String> {
+    let take = || match closes.lock() {
+        Ok(mut t) => t.take_user_closed(mine),
+        Err(_) => HashSet::new(),
+    };
+    let mut claimed = take();
+    let deadline = Instant::now() + lag;
+    while awaiting(&claimed) && Instant::now() < deadline {
+        tokio::time::sleep(CLOSE_EVENT_POLL).await;
+        claimed.extend(take());
+    }
+    claimed
+}
+
 /// Returns the post-converge state so callers don't re-read the state file.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
     let mut state = load_state(&deps.state_dir, &deps.host.name);
@@ -1022,17 +1122,22 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     //    which also happens mid-rebuild, after a failed converge, or while the
     //    local server is restarting.
     let close_remote = deps.close_remote_on_local_close;
-    let mine: HashSet<String> = state
-        .workspaces
-        .values()
-        .map(|e| e.local_id.clone())
-        .chain(state.panes.values().map(|e| e.local_id.clone()))
-        .chain(state.tabs.values().map(|e| e.local_id.clone()))
-        .collect();
-    let user_closed = match deps.closes.lock() {
-        Ok(mut t) => t.take_user_closed(&mine),
-        Err(_) => HashSet::new(),
+    let mine = absent_mapped_ids(state, &local_ws_ids, &local_tab_ids, &local_pane_ids);
+    let pane_ws: HashMap<&str, &str> =
+        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())).collect();
+    let pane_tab: HashMap<&str, &str> =
+        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.tab_id.as_str())).collect();
+    let view = CloseView {
+        local_ws: &local_ws_ids,
+        local_panes: &local_pane_ids,
+        remote_ws: &remote_ws_ids,
+        remote_panes: &remote_pane_ids,
+        pane_ws: &pane_ws,
+        pane_tab: &pane_tab,
     };
+    let user_closed =
+        claim_user_closes(&deps.closes, &mine, CLOSE_EVENT_LAG, |claimed| awaiting_close_event(state, &view, claimed))
+            .await;
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
         if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
@@ -1050,10 +1155,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             log.log(&format!("remote workspace close failed for {rid}: {e}"));
         }
     }
-    let pane_ws: HashMap<&str, &str> =
-        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())).collect();
-    let pane_tab: HashMap<&str, &str> =
-        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.tab_id.as_str())).collect();
     let mut drop_panes: Vec<String> = Vec::new();
     let mut pane_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.panes.iter_mut() {
@@ -2723,5 +2824,116 @@ mod tests {
         assert_eq!(base.fingerprint(), wider.fingerprint());
         assert_ne!(base.fingerprint(), dragged.fingerprint());
         assert_ne!(base.fingerprint(), swapped.fingerprint());
+    }
+
+    fn close_state() -> HostState {
+        let mut s = HostState::default();
+        s.workspaces.insert(
+            "w2".into(),
+            WsEntry { local_id: "w9".into(), tombstone: None, root_tab_local_id: None, last_remote_label: None },
+        );
+        s.tabs.insert("w2:t1".into(), crate::state::TabEntry { local_id: "w9:t1".into(), last_remote_label: None });
+        for (r, l) in [("w2:p1", "w9:p1"), ("w2:p2", "w9:p2")] {
+            s.panes.insert(r.into(), PaneEntry { local_id: l.into(), tombstone: None, seq: 0, reported: None });
+        }
+        s
+    }
+
+    fn ids<'a>(v: &[&'a str]) -> HashSet<&'a str> {
+        v.iter().copied().collect()
+    }
+
+    /// The intent for an object the snapshot still lists is not consumed: the
+    /// snapshot predates the close (a slow remote snapshot held the pass open),
+    /// and the pass that can see the object gone must still find the intent.
+    #[test]
+    fn only_ids_the_snapshot_no_longer_lists_may_have_their_close_consumed() {
+        let s = close_state();
+        let ws: HashSet<String> = ["w9".to_string()].into();
+        let absent = absent_mapped_ids(&s, &ws, &ids(&["w9:t1"]), &ids(&["w9:p1"]));
+        assert_eq!(absent, ["w9:p2".to_string()].into(), "only the pane the snapshot dropped");
+        let absent = absent_mapped_ids(&s, &ws, &ids(&[]), &ids(&[]));
+        assert_eq!(absent, ["w9:t1".to_string(), "w9:p1".to_string(), "w9:p2".to_string()].into());
+
+        let closes = crate::closes::new_closes();
+        closes.lock().unwrap().note_close_event("w9:t1"); // event beat the snapshot's age
+        let present = absent_mapped_ids(&s, &ws, &ids(&["w9:t1"]), &ids(&["w9:p1", "w9:p2"]));
+        assert!(closes.lock().unwrap().take_user_closed(&present).is_empty());
+        // the pass that sees the tab gone still finds it
+        let gone = absent_mapped_ids(&s, &ws, &ids(&[]), &ids(&[]));
+        assert_eq!(closes.lock().unwrap().take_user_closed(&gone), ["w9:t1".to_string()].into());
+    }
+
+    /// A live mirror that is gone from the hub with no claimed close is awaited;
+    /// a claimed pane, a claimed tab, a tombstone, a remote object that is
+    /// itself gone, and a pane whose workspace is gone are not.
+    #[test]
+    fn a_vanished_mirror_without_a_claimed_close_is_awaited() {
+        let s = close_state();
+        let ws: HashSet<String> = ["w9".to_string()].into();
+        let (rws, rp) = (ids(&["w2"]), ids(&["w2:p1", "w2:p2"]));
+        let pane_ws: HashMap<&str, &str> = [("w2:p1", "w2"), ("w2:p2", "w2")].into();
+        let pane_tab: HashMap<&str, &str> = [("w2:p1", "w2:t1"), ("w2:p2", "w2:t1")].into();
+        let none: HashSet<String> = HashSet::new();
+        let wait = |s: &HostState, ws: &HashSet<String>, lp: &HashSet<&str>, rws: &HashSet<&str>, rp: &HashSet<&str>, c: &HashSet<String>| {
+            let view = CloseView {
+                local_ws: ws,
+                local_panes: lp,
+                remote_ws: rws,
+                remote_panes: rp,
+                pane_ws: &pane_ws,
+                pane_tab: &pane_tab,
+            };
+            awaiting_close_event(s, &view, c)
+        };
+        let present = ids(&["w9:p1", "w9:p2"]);
+        let gone = ids(&[]);
+        assert!(!wait(&s, &ws, &present, &rws, &rp, &none), "every mirror pane is still on the hub: nothing to await");
+        assert!(!wait(&s, &ws, &ids(&["w9:p1"]), &rws, &ids(&["w2:p1"]), &none), "the vanished pane is gone remotely too");
+        assert!(wait(&s, &ws, &ids(&["w9:p1"]), &rws, &rp, &none), "one pane gone locally, no claim yet");
+        assert!(wait(&s, &ws, &gone, &rws, &rp, &none), "panes listed on the remote, mirror panes unclaimed");
+        let tab: HashSet<String> = ["w9:t1".to_string()].into();
+        assert!(!wait(&s, &ws, &gone, &rws, &rp, &tab), "the tab close claims its panes");
+        let both: HashSet<String> = ["w9:p1".to_string(), "w9:p2".to_string()].into();
+        assert!(!wait(&s, &ws, &gone, &rws, &rp, &both));
+        assert!(!wait(&s, &ws, &gone, &rws, &ids(&[]), &none), "remote already lost the panes");
+        let ws_claimed: HashSet<String> = ["w9".to_string()].into();
+        assert!(!wait(&s, &HashSet::new(), &gone, &rws, &rp, &ws_claimed), "workspace close claimed: its panes are collateral");
+        assert!(wait(&s, &HashSet::new(), &present, &rws, &rp, &none), "workspace gone, close unclaimed");
+        let mut ts = s.clone();
+        ts.panes.values_mut().for_each(|p| p.tombstone = Some(true));
+        assert!(!wait(&ts, &ws, &gone, &rws, &rp, &none), "already tombstoned");
+        assert!(wait(&s, &HashSet::new(), &present, &rws, &ids(&[]), &none), "a live workspace gone with no claimed close");
+    }
+
+    /// The race that left remotes open: the snapshot shows the tab gone, the
+    /// event arrives ~100 ms later. The pass waits for it and claims it; with no
+    /// event it waits out the lag and claims nothing; with nothing awaited it
+    /// does not wait at all.
+    #[tokio::test]
+    async fn a_close_event_that_trails_the_snapshot_is_still_claimed() {
+        let mine: HashSet<String> = ["w9:t1".to_string()].into();
+        let closes = crate::closes::new_closes();
+        let late = closes.clone();
+        let event = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            late.lock().unwrap().note_close_event("w9:t1");
+        });
+        let t0 = Instant::now();
+        let claimed = claim_user_closes(&closes, &mine, Duration::from_secs(2), |c| !c.contains("w9:t1")).await;
+        assert_eq!(claimed, mine);
+        assert!(t0.elapsed() >= Duration::from_millis(100) && t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        event.await.unwrap();
+
+        // a vanished mirror nobody closed: waits out the lag, claims nothing
+        let t0 = Instant::now();
+        let claimed = claim_user_closes(&closes, &mine, Duration::from_millis(200), |_| true).await;
+        assert!(claimed.is_empty());
+        assert!(t0.elapsed() >= Duration::from_millis(200));
+
+        // nothing awaited: no wait
+        let t0 = Instant::now();
+        claim_user_closes(&closes, &mine, Duration::from_secs(2), |_| false).await;
+        assert!(t0.elapsed() < Duration::from_millis(50));
     }
 }
